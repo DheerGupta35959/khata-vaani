@@ -1,4 +1,5 @@
 import logging
+import time
 
 from dotenv import load_dotenv
 from livekit import rtc
@@ -20,9 +21,20 @@ logger = logging.getLogger("agent")
 
 load_dotenv(".env.local")
 
-# Change this prompt to change what your voice agent does.
-# See README.md for example prompts (customer support, language tutor, receptionist).
-SYSTEM_PROMPT = """You are a friendly and efficient customer support agent for a tech company. Help users with account issues, billing questions, and product troubleshooting. Be concise, empathetic, and solution-oriented. If you don't know something, say so honestly and offer to escalate. Your responses are concise and without complex formatting, emojis, or symbols."""
+# Khata-Vaani — voice bookkeeping agent for Indian shopkeepers.
+SYSTEM_PROMPT = """You are Khata-Vaani, a voice assistant that helps a small Indian shopkeeper log sales and udhaar (credit) entries, and recall who owes what.
+
+Your job:
+- When the shopkeeper tells you what they sold or gave on credit, capture the details in plain language.
+- For a sale ask for: the item and the amount (e.g. "hair oil, 150 rupees").
+- For udhaar (credit), also ask who took it — the customer's name — in addition to item and amount.
+- Always confirm the entry before save: repeat back the item, amount, and customer name (if udhaar) and ask the shopkeeper to confirm. This confirmation is just an acknowledgment for now — you are not actually storing anything yet.
+
+How to speak:
+- Use simple, direct Indian English. Short sentences. No filler, no corporate tone, no jargon.
+- Keep responses brief and conversational, like talking to someone across a shop counter.
+- If you did not clearly hear the amount or the customer's name, ask once for them to repeat it.
+- Your responses are concise and without complex formatting, emojis, or symbols."""
 
 
 class Assistant(Agent):
@@ -78,7 +90,7 @@ async def my_agent(ctx: JobContext):
         # Text-to-speech (TTS) is your agent's voice, turning the LLM's text into speech that the user can hear
         # See all available models as well as voice selections at https://docs.livekit.io/agents/models/tts/
         tts=murf.TTS(
-                voice="Anisha", 
+                voice="Pooja",  # en-IN Indian English (Falcon 2) — Murf voice library
                 locale="en-IN",
                 style="Conversation",
                 tokenizer=tokenize.basic.SentenceTokenizer(min_sentence_len=2),
@@ -92,6 +104,23 @@ async def my_agent(ctx: JobContext):
         # See more at https://docs.livekit.io/agents/build/audio/#preemptive-generation
         preemptive_generation=True,
     )
+
+    # Measure end-of-speech -> first audio out latency.
+    # Start clock once the user's utterance finishes transcribing (end of their speech),
+    # stop at the first agent audio playback (agent state flips to "speaking").
+    speech_end_ts = {"t": None}
+
+    @session.on("user_input_transcribed")
+    def _on_user_input(ev):
+        if ev.is_final:
+            speech_end_ts["t"] = time.perf_counter()
+
+    @session.on("agent_state_changed")
+    def _on_agent_state(ev):
+        if ev.new_state == "speaking" and speech_end_ts["t"] is not None:
+            ms = (time.perf_counter() - speech_end_ts["t"]) * 1000
+            logger.info(f"[LATENCY] end-of-speech to first audio out: {ms:.1f}ms")
+            speech_end_ts["t"] = None
 
     # To use a realtime model instead of a voice pipeline, use the following session setup instead.
     # (Note: This is for the OpenAI Realtime API. For other providers, see https://docs.livekit.io/agents/models/realtime/))

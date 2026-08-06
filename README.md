@@ -1,8 +1,17 @@
-# Voice Agent Starter — Powered by Murf Falcon
+# Khata-Vaani — Voice Agent for Indian Shopkeepers
 
-Build a production voice AI agent in 5 minutes. Powered by the fastest TTS on the market - swap the system prompt to build anything from customer support to language tutors.
+Khata-Vaani is a voice AI agent that helps Indian shopkeepers log daily sales and udhaar (credit given to customers) by speaking naturally, and recall who owes what. Built on the Murf Falcon + LiveKit voice-agent starter.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT) [![Murf Falcon](https://img.shields.io/badge/TTS-Murf%20Falcon-6366F1)](https://murf.ai/api/docs/text-to-speech/streaming) [![LiveKit](https://img.shields.io/badge/Transport-LiveKit-002cf2)](https://docs.livekit.io) [![TypeScript](https://img.shields.io/badge/TypeScript-007ACC?logo=typescript&logoColor=white)](https://www.typescriptlang.org/) [![Python](https://img.shields.io/badge/Python-3.10+-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+
+---
+
+## What Khata-Vaani does
+
+- Takes a sale or an udhaar entry by voice, asking for item, amount, and customer name (for udhaar)
+- Confirms the entry by repeating it back before saving
+- Speaks simple, direct Indian English — no filler, no corporate tone
+- *(Day 1: acknowledges and repeats back what it heard; persistence comes later)*
 
 ---
 
