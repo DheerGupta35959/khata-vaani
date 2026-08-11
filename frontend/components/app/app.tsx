@@ -12,6 +12,7 @@ import { Toaster } from '@/components/ui/sonner';
 import { useAgentErrors } from '@/hooks/useAgentErrors';
 import { useDebugMode } from '@/hooks/useDebug';
 import { getSandboxTokenSource } from '@/lib/utils';
+import { labels } from '@/lib/labels';
 
 const IN_DEVELOPMENT = process.env.NODE_ENV !== 'production';
 
@@ -44,7 +45,7 @@ export function App({ appConfig }: AppProps) {
       <main className="grid h-svh grid-cols-1 place-content-center">
         <ViewController appConfig={appConfig} />
       </main>
-      <StartAudioButton label="Start Audio" />
+      <StartAudioButton label={labels.tapToHear.en} />
       <Toaster
         icons={{
           warning: <WarningIcon weight="bold" />,

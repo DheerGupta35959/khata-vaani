@@ -8,7 +8,9 @@ import {
   AgentControlBar,
   type AgentControlBarControls,
 } from '@/components/agents-ui/agent-control-bar';
+import { AgentStatus } from '@/components/app/agent-status';
 import { Shimmer } from '@/components/ai-elements/shimmer';
+import { labels } from '@/lib/labels';
 import { cn } from '@/lib/shadcn/utils';
 import { TileLayout } from './tile-view';
 
@@ -156,7 +158,7 @@ export interface AgentSessionView_01Props {
 }
 
 export function AgentSessionView_01({
-  preConnectMessage = 'Agent is listening, ask it a question',
+  preConnectMessage = labels.listeningHint.en,
   supportsChatInput = true,
   supportsVideoInput = true,
   supportsScreenShare = true,
@@ -180,6 +182,9 @@ export function AgentSessionView_01({
   const [chatOpen, setChatOpen] = useState(false);
   const scrollAreaRef = useRef<HTMLDivElement>(null);
   const { state: agentState } = useAgent();
+  const statusState = agentState === 'speaking' ? 'speaking' : 'listening';
+  const visualizerColor =
+    statusState === 'speaking' ? '#7A1F2B' : '#3D7A4F';
 
   const controls: AgentControlBarControls = {
     leave: true,
@@ -205,6 +210,11 @@ export function AgentSessionView_01({
       {...props}
     >
       <Fade top className="absolute inset-x-4 top-0 z-10 h-40" />
+      {/* In-call status (Listening / Speaking) with distinct visuals */}
+      <AgentStatus
+        state={statusState}
+        className="absolute top-4 left-1/2 z-30 -translate-x-1/2"
+      />
       {/* transcript */}
 
       <div className="absolute top-0 bottom-[135px] flex w-full flex-col md:bottom-[170px]">
@@ -227,7 +237,7 @@ export function AgentSessionView_01({
       <TileLayout
         chatOpen={chatOpen}
         audioVisualizerType={audioVisualizerType}
-        audioVisualizerColor={audioVisualizerColor}
+        audioVisualizerColor={audioVisualizerColor ?? visualizerColor}
         audioVisualizerColorShift={audioVisualizerColorShift}
         audioVisualizerBarCount={audioVisualizerBarCount}
         audioVisualizerRadialBarCount={audioVisualizerRadialBarCount}
