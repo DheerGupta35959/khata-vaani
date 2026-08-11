@@ -11,10 +11,24 @@ import { ViewController } from '@/components/app/view-controller';
 import { Toaster } from '@/components/ui/sonner';
 import { useAgentErrors } from '@/hooks/useAgentErrors';
 import { useDebugMode } from '@/hooks/useDebug';
-import { getSandboxTokenSource } from '@/lib/utils';
 import { labels } from '@/lib/labels';
+import { getSandboxTokenSource } from '@/lib/utils';
 
 const IN_DEVELOPMENT = process.env.NODE_ENV !== 'production';
+
+/**
+ * Stable per-browser caller id, so the agent's SQLite memory keys the ledger
+ * to the same shopkeeper across sessions and page reloads.
+ */
+function getCallerId(): string {
+  const KEY = 'khata_caller_id';
+  let id = localStorage.getItem(KEY);
+  if (!id) {
+    id = `shopkeeper_${crypto.randomUUID().slice(0, 8)}`;
+    localStorage.setItem(KEY, id);
+  }
+  return id;
+}
 
 function AppSetup() {
   useDebugMode({ enabled: IN_DEVELOPMENT });
@@ -29,9 +43,21 @@ interface AppProps {
 
 export function App({ appConfig }: AppProps) {
   const tokenSource = useMemo(() => {
-    return typeof process.env.NEXT_PUBLIC_CONN_DETAILS_ENDPOINT === 'string'
-      ? getSandboxTokenSource(appConfig)
-      : TokenSource.endpoint('/api/token');
+    if (typeof process.env.NEXT_PUBLIC_CONN_DETAILS_ENDPOINT === 'string') {
+      return getSandboxTokenSource(appConfig);
+    }
+    // Post a stable identity so the agent can recognise a returning shopkeeper.
+    return TokenSource.custom(async () => {
+      const res = await fetch('/api/token', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ identity: getCallerId() }),
+      });
+      if (!res.ok) {
+        throw new Error(`Token endpoint returned ${res.status}`);
+      }
+      return res.json();
+    });
   }, [appConfig]);
 
   const session = useSession(

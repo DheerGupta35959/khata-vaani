@@ -82,18 +82,27 @@ export default async function RootLayout({ children }: RootLayoutProps) {
                 className="text-primary"
                 aria-hidden
               >
-                <rect x="4" y="6" width="24" height="20" rx="3" fill="currentColor" opacity="0.15" />
-                <path d="M8 12h16M8 16h16M8 20h10" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
+                <rect
+                  x="4"
+                  y="6"
+                  width="24"
+                  height="20"
+                  rx="3"
+                  fill="currentColor"
+                  opacity="0.15"
+                />
+                <path
+                  d="M8 12h16M8 16h16M8 20h10"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                />
                 <circle cx="8" cy="10" r="1.5" fill="currentColor" />
               </svg>
-              <span className="text-foreground text-sm font-bold tracking-wide">
-                Khata-Vaani
-              </span>
+              <span className="text-foreground text-sm font-bold tracking-wide">Khata-Vaani</span>
               <span className="text-muted-foreground text-xs">खाता-वाणी</span>
             </div>
-            <span className="text-muted-foreground text-xs">
-              Bolkar likhein apna khata
-            </span>
+            <span className="text-muted-foreground text-xs">Bolkar likhein apna khata</span>
           </header>
 
           {children}

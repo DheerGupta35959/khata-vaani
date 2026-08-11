@@ -2,10 +2,10 @@
 
 import { useCallback, useEffect, useState } from 'react';
 import { useTheme } from 'next-themes';
-import { AnimatePresence, motion } from 'motion/react';
-import { useSessionContext } from '@livekit/components-react';
-import { Loader } from 'lucide-react';
 import { MediaDeviceFailure } from 'livekit-client';
+import { Loader } from 'lucide-react';
+import { AnimatePresence, type MotionProps, motion } from 'motion/react';
+import { useSessionContext } from '@livekit/components-react';
 import type { AppConfig } from '@/app-config';
 import { AgentSessionView_01 } from '@/components/agents-ui/blocks/agent-session-view-01';
 import { CallEndedView } from '@/components/app/call-ended-view';
@@ -16,7 +16,7 @@ const MotionWelcomeView = motion.create(WelcomeView);
 const MotionCallEndedView = motion.create(CallEndedView);
 const MotionSessionView = motion.create(AgentSessionView_01);
 
-const VIEW_MOTION_PROPS = {
+const VIEW_MOTION_PROPS: MotionProps = {
   variants: {
     visible: {
       opacity: 1,
@@ -129,7 +129,11 @@ export function ViewController({ appConfig }: ViewControllerProps) {
     view = <ConnectingView key="connecting" />;
   } else if (hasEnded) {
     view = (
-      <MotionCallEndedView key="call-ended" {...VIEW_MOTION_PROPS} onStartAgain={handleStartAgain} />
+      <MotionCallEndedView
+        key="call-ended"
+        {...VIEW_MOTION_PROPS}
+        onStartAgain={handleStartAgain}
+      />
     );
   } else {
     view = (

@@ -1,7 +1,7 @@
 'use client';
 
-import { motion } from 'motion/react';
 import { Mic } from 'lucide-react';
+import { motion } from 'motion/react';
 import { labels } from '@/lib/labels';
 import { cn } from '@/lib/shadcn/utils';
 

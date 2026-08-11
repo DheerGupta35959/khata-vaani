@@ -6,11 +6,14 @@ interface CallEndedViewProps {
   onStartAgain: () => void;
 }
 
-export const CallEndedView = ({ onStartAgain, ref }: React.ComponentProps<'div'> & CallEndedViewProps) => {
+export const CallEndedView = ({
+  onStartAgain,
+  ref,
+}: React.ComponentProps<'div'> & CallEndedViewProps) => {
   return (
     <div ref={ref}>
       <section className="bg-background flex flex-col items-center justify-center px-6 text-center">
-        <div className="mb-4 flex size-20 items-center justify-center rounded-full bg-muted">
+        <div className="bg-muted mb-4 flex size-20 items-center justify-center rounded-full">
           <PhoneOff className="text-muted-foreground size-10" />
         </div>
 

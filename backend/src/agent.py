@@ -10,12 +10,16 @@ from livekit.agents import (
     AgentSession,
     JobContext,
     JobProcess,
+    RunContext,
     cli,
+    function_tool,
     room_io,
     tokenize,
 )
 from livekit.plugins import deepgram, google, murf, noise_cancellation, silero
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
+
+import khata_memory
 
 logger = logging.getLogger("agent")
 
@@ -31,25 +35,41 @@ track daily sales and udhaar (credit given to customers). You work for the
 shopkeeper, not for any bank, lender, or platform.
 
 OBJECTIVES
-1. Log a sale or udhaar entry: capture item/amount, and customer name if it's
-   credit. Always read it back and confirm before treating it as saved.
-2. Answer "who owes me how much" queries from what's been logged.
-3. If asked for a summary, you may mention outstanding udhaar, but only when
+1. At the start of every session, call lookup_caller to check whether this
+   shopkeeper is returning.
+2. If returning, greet them by name and mention their most notable open
+   udhaar - the customer with the highest balance, or the most recently
+   updated one. If they are new, introduce yourself and ask their name and
+   shop name, passing them to lookup_caller so they are remembered.
+3. Log a sale or udhaar entry: capture item/amount, and customer name if it's
+   credit. Before calling save_customer_entry, say out loud exactly what you
+   are about to save and get explicit confirmation. If the shopkeeper says no
+   or corrects you, do not call the save function.
+4. Answer "who owes me how much" queries from the saved ledger.
+5. If asked for a summary, you may mention outstanding udhaar, but only when
    asked - don't volunteer it unprompted.
 
 KNOWLEDGE
-You only know what the shopkeeper has told you in this session (no real
-persistence yet). You do not know market prices, loan terms, interest rates,
-or anything about the customer beyond what's logged. Say so plainly when
-asked something outside that.
+You only know what has been saved in this shopkeeper's khata (SQLite-backed
+memory). You do not know market prices, loan terms, interest rates, or
+anything about the customer beyond what's saved. Say so plainly when asked
+something outside that.
 
 LANGUAGE
 Mirror the user. If they mix Hindi and English mid-sentence, understand it
 and you may reply in the same mixed register if that's what they used first.
 Keep sentences short - this is spoken, not read.
 
+LANGUAGE & SCRIPT
+Always write every language in its own native script. Hindi → Devanagari
+(नमस्ते), never romanized (never 'namaste'). Same rule for all non-English
+languages.
+
 GUARDRAILS
 - Never ask for OTP, PIN, UPI ID, or account/card numbers, under any framing.
+- Never store account numbers, card numbers, or any government ID numbers
+  (Aadhaar, PAN, etc.) in any saved record, even if the shopkeeper offers
+  them.
 - Never confirm a loan, credit line, or scheme approval - you only log what
   you're told, you don't verify or approve anything financial.
 - Never advise whether the shopkeeper should extend more credit to a
@@ -68,22 +88,60 @@ class Assistant(Agent):
     def __init__(self) -> None:
         super().__init__(instructions=SYSTEM_PROMPT)
 
-    # To add tools, use the @function_tool decorator.
-    # Here's an example that adds a simple weather tool.
-    # You also have to add `from livekit.agents import function_tool, RunContext` to the top of this file
-    # @function_tool
-    # async def lookup_weather(self, context: RunContext, location: str):
-    #     """Use this tool to look up current weather information in the given location.
-    #
-    #     If the location is not supported by the weather service, the tool will indicate this. You must tell the user the location's weather is unavailable.
-    #
-    #     Args:
-    #         location: The location to look up weather information for (e.g. city name)
-    #     """
-    #
-    #     logger.info(f"Looking up weather for {location}")
-    #
-    #     return "sunny with a temperature of 70 degrees."
+    @function_tool
+    async def lookup_caller(
+        self,
+        context: RunContext,
+        user_id: str = "",
+        name: str | None = None,
+        shop_name: str | None = None,
+    ):
+        """Look up the shopkeeper's saved profile and customer ledger.
+
+        Call this once at the start of a session to check whether the shopkeeper
+        is returning. Returns their name, shop name, language preference, usual
+        items sold, and each customer's udhaar balance (highest first).
+
+        Args:
+            user_id: The shopkeeper's caller id. Leave empty to use the session
+                caller automatically.
+            name: The shopkeeper's name, if they just told you it. It will be
+                remembered for next time.
+            shop_name: The shop name, if they just told you it. It will be
+                remembered for next time.
+        """
+        resolved_id = user_id or (context.userdata or {}).get("user_id", "unknown")
+        if name or shop_name:
+            khata_memory.remember_profile(
+                resolved_id, name=name, shop_name=shop_name
+            )
+        logger.info("lookup_caller user=%s", resolved_id)
+        return khata_memory.lookup_caller(resolved_id)
+
+    @function_tool
+    async def save_customer_entry(
+        self, context: RunContext, name: str, amount: float, entry_type: str
+    ):
+        """Save a sale or update a customer's udhaar balance.
+
+        Only call this AFTER the shopkeeper has explicitly confirmed the details
+        out loud. Use entry_type "udhaar" to add `amount` to a customer's credit
+        balance, or "sale" to log an item sold.
+
+        Args:
+            name: Customer name for udhaar, or item name for a sale.
+            amount: Amount in rupees.
+            entry_type: "udhaar" or "sale".
+        """
+        user_id = (context.userdata or {}).get("user_id", "unknown")
+        logger.info(
+            "save_customer_entry user=%s type=%s name=%s amount=%s",
+            user_id,
+            entry_type,
+            name,
+            amount,
+        )
+        return khata_memory.save_customer_entry(user_id, name, amount, entry_type)
 
 
 server = AgentServer()
@@ -108,8 +166,9 @@ async def my_agent(ctx: JobContext):
     session = AgentSession(
         # Speech-to-text (STT) is your agent's ears, turning the user's speech into text that the LLM can understand
         # See all available models at https://docs.livekit.io/agents/models/stt/
-        # hi-Latn = Hinglish (Hindi in Latin script) — supports Hindi-English code-mixing, e.g. "hair oil, 150 rupee"
-        stt=deepgram.STT(model="nova-3", language="hi-Latn"),
+        # "multi" = Deepgram auto-detects language per utterance, so code-switched
+        # Hindi/English ("hair oil, 150 rupee") transcribes correctly
+        stt=deepgram.STT(model="nova-3", language="multi"),
         # A Large Language Model (LLM) is your agent's brain, processing user input and generating a response
         # See all available models at https://docs.livekit.io/agents/models/llm/
         llm=google.LLM(
@@ -225,6 +284,10 @@ async def my_agent(ctx: JobContext):
 
     # Join the room and connect to the user
     await ctx.connect()
+
+    # Persist the caller's identity so the memory tools can key the ledger on it
+    remote = next(iter(ctx.room.remote_participants)) if ctx.room.remote_participants else "unknown"
+    session.userdata = {"user_id": remote}
 
 
 if __name__ == "__main__":

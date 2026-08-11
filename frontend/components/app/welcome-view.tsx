@@ -13,7 +13,12 @@ function WelcomeImage() {
       className="text-primary mb-4 size-16"
     >
       <rect x="4" y="6" width="24" height="20" rx="3" fill="currentColor" opacity="0.15" />
-      <path d="M8 12h16M8 16h16M8 20h10" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
+      <path
+        d="M8 12h16M8 16h16M8 20h10"
+        stroke="currentColor"
+        strokeWidth="2"
+        strokeLinecap="round"
+      />
       <circle cx="8" cy="10" r="1.5" fill="currentColor" />
     </svg>
   );
@@ -25,7 +30,7 @@ function MicPermissionPointer() {
     <div className="mt-3">
       <svg
         viewBox="0 0 260 64"
-        className="mx-auto h-16 w-full max-w-xs text-foreground"
+        className="text-foreground mx-auto h-16 w-full max-w-xs"
         role="img"
         aria-label={labels.micIconPointer.en}
       >
@@ -60,7 +65,6 @@ interface WelcomeViewProps {
 }
 
 export const WelcomeView = ({
-  startButtonText,
   onStartCall,
   micBlocked = false,
   ref,
@@ -90,10 +94,10 @@ export const WelcomeView = ({
         {micBlocked && (
           <div
             role="alert"
-            className="mt-6 w-full max-w-md rounded-2xl border border-destructive/40 bg-destructive/5 p-4 text-left"
+            className="border-destructive/40 bg-destructive/5 mt-6 w-full max-w-md rounded-2xl border p-4 text-left"
           >
             <div className="flex items-center gap-2">
-              <ShieldAlert className="size-5 shrink-0 text-destructive" />
+              <ShieldAlert className="text-destructive size-5 shrink-0" />
               <p className="text-destructive text-sm font-bold">{labels.micBlockedTitle.en}</p>
             </div>
             <p className="text-sm">{labels.micBlockedBody.en}</p>

@@ -43,10 +43,16 @@ export async function POST(req: Request) {
         { ignoreUnknownFields: true }
       );
     }
-      
+
+    // Stable caller id from the browser (see app.tsx) so the same shopkeeper is
+    // recognised across sessions; fall back to a random identity otherwise.
+    const participantIdentity =
+      typeof body?.identity === 'string' && body.identity.trim().length > 0
+        ? body.identity.trim()
+        : `voice_assistant_user_${Math.floor(Math.random() * 10_000)}`;
+
     // Generate participant token
     const participantName = 'user';
-    const participantIdentity = `voice_assistant_user_${Math.floor(Math.random() * 10_000)}`;
     const roomName = `voice_assistant_room_${Math.floor(Math.random() * 10_000)}`;
 
     const participantToken = await createParticipantToken(
