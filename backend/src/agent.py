@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import time
 
@@ -10,11 +11,10 @@ from livekit.agents import (
     JobContext,
     JobProcess,
     cli,
-    inference,
-    tokenize,
     room_io,
+    tokenize,
 )
-from livekit.plugins import murf, silero, google, deepgram, noise_cancellation
+from livekit.plugins import deepgram, google, murf, noise_cancellation, silero
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
 logger = logging.getLogger("agent")
@@ -22,19 +22,46 @@ logger = logging.getLogger("agent")
 load_dotenv(".env.local")
 
 # Khata-Vaani — voice bookkeeping agent for Indian shopkeepers.
-SYSTEM_PROMPT = """You are Khata-Vaani, a voice assistant that helps a small Indian shopkeeper log sales and udhaar (credit) entries, and recall who owes what.
+silent_nudge = "Still there? Go ahead whenever you're ready."
+silent_close = "It's been quiet, so I'll close up now. Take care, bye!"
 
-Your job:
-- When the shopkeeper tells you what they sold or gave on credit, capture the details in plain language.
-- For a sale ask for: the item and the amount (e.g. "hair oil, 150 rupees").
-- For udhaar (credit), also ask who took it — the customer's name — in addition to item and amount.
-- Always confirm the entry before save: repeat back the item, amount, and customer name (if udhaar) and ask the shopkeeper to confirm. This confirmation is just an acknowledgment for now — you are not actually storing anything yet.
+SYSTEM_PROMPT = """IDENTITY
+You are Khata-Vaani, a voice assistant that helps small shopkeepers in India
+track daily sales and udhaar (credit given to customers). You work for the
+shopkeeper, not for any bank, lender, or platform.
 
-How to speak:
-- Use simple, direct Indian English. Short sentences. No filler, no corporate tone, no jargon.
-- Keep responses brief and conversational, like talking to someone across a shop counter.
-- If you did not clearly hear the amount or the customer's name, ask once for them to repeat it.
-- Your responses are concise and without complex formatting, emojis, or symbols."""
+OBJECTIVES
+1. Log a sale or udhaar entry: capture item/amount, and customer name if it's
+   credit. Always read it back and confirm before treating it as saved.
+2. Answer "who owes me how much" queries from what's been logged.
+3. If asked for a summary, you may mention outstanding udhaar, but only when
+   asked - don't volunteer it unprompted.
+
+KNOWLEDGE
+You only know what the shopkeeper has told you in this session (no real
+persistence yet). You do not know market prices, loan terms, interest rates,
+or anything about the customer beyond what's logged. Say so plainly when
+asked something outside that.
+
+LANGUAGE
+Mirror the user. If they mix Hindi and English mid-sentence, understand it
+and you may reply in the same mixed register if that's what they used first.
+Keep sentences short - this is spoken, not read.
+
+GUARDRAILS
+- Never ask for OTP, PIN, UPI ID, or account/card numbers, under any framing.
+- Never confirm a loan, credit line, or scheme approval - you only log what
+  you're told, you don't verify or approve anything financial.
+- Never advise whether the shopkeeper should extend more credit to a
+  customer - that's their call.
+- If asked anything outside logging sales/udhaar or recalling what's logged
+  (loan advice, investments, payments), say: "That's outside what I handle -
+  I just help you keep track of your khata." Then stop, don't improvise.
+
+STYLE
+Short sentences, under ~20 words. No lists, no brackets, nothing written for
+a screen - this gets spoken aloud. If the user goes silent, the silence
+handler covers re-prompting - don't add your own "are you there" logic here."""
 
 
 class Assistant(Agent):
@@ -81,7 +108,8 @@ async def my_agent(ctx: JobContext):
     session = AgentSession(
         # Speech-to-text (STT) is your agent's ears, turning the user's speech into text that the LLM can understand
         # See all available models at https://docs.livekit.io/agents/models/stt/
-        stt=deepgram.STT(model="nova-3"),
+        # hi-Latn = Hinglish (Hindi in Latin script) — supports Hindi-English code-mixing, e.g. "hair oil, 150 rupee"
+        stt=deepgram.STT(model="nova-3", language="hi-Latn"),
         # A Large Language Model (LLM) is your agent's brain, processing user input and generating a response
         # See all available models at https://docs.livekit.io/agents/models/llm/
         llm=google.LLM(
@@ -103,6 +131,9 @@ async def my_agent(ctx: JobContext):
         # allow the LLM to generate a response while waiting for the end of turn
         # See more at https://docs.livekit.io/agents/build/audio/#preemptive-generation
         preemptive_generation=True,
+        # mark the user as "away" after this much silence (both agent and user
+        # quiet) so we can nudge them — no fixed sleep timers needed
+        user_away_timeout=6.0,
     )
 
     # Measure end-of-speech -> first audio out latency.
@@ -121,6 +152,42 @@ async def my_agent(ctx: JobContext):
             ms = (time.perf_counter() - speech_end_ts["t"]) * 1000
             logger.info(f"[LATENCY] end-of-speech to first audio out: {ms:.1f}ms")
             speech_end_ts["t"] = None
+
+    # Silence handling — driven by LiveKit's built-in "away" detection
+    # (user_away_timeout). First silent gap: gentle nudge. Still silent after
+    # the nudge: close politely instead of repeating forever.
+    away_state = {"nudges": 0, "watch": None}
+
+    async def _close_after_silence() -> None:
+        try:
+            await asyncio.sleep(6.0)
+            if session.user_state == "away":
+                handle = session.say(silent_close, add_to_chat_ctx=False)
+                handle.add_done_callback(lambda _: session.shutdown())
+        except asyncio.CancelledError:
+            pass
+
+    @session.on("user_state_changed")
+    def _on_user_state(ev):
+        if ev.new_state == "away":
+            away_state["nudges"] += 1
+            if away_state["nudges"] == 1:
+                session.say(silent_nudge, add_to_chat_ctx=False)
+        else:
+            # user spoke (or is speaking) — this is a fresh gap
+            away_state["nudges"] = 0
+            if away_state["watch"] is not None:
+                away_state["watch"].cancel()
+                away_state["watch"] = None
+
+    @session.on("agent_state_changed")
+    def _on_agent_state_silence(ev):
+        if (
+            ev.new_state == "listening"
+            and away_state["nudges"] == 1
+            and away_state["watch"] is None
+        ):
+            away_state["watch"] = asyncio.create_task(_close_after_silence())
 
     # To use a realtime model instead of a voice pipeline, use the following session setup instead.
     # (Note: This is for the OpenAI Realtime API. For other providers, see https://docs.livekit.io/agents/models/realtime/))
