@@ -116,6 +116,19 @@ def remember_profile(user_id: str, *, name: str | None, shop_name: str | None) -
         conn.execute(f"UPDATE users SET {', '.join(fields)} WHERE user_id = ?", values)
 
 
+def get_profile(user_id: str) -> dict:
+    """Return the shopkeeper's raw profile + facts for tooling (no writes)."""
+    init_db()
+    with _db() as conn:
+        row = conn.execute(
+            "SELECT name, shop_name, facts FROM users WHERE user_id = ?", (user_id,)
+        ).fetchone()
+    if row is None:
+        return {}
+    facts = json.loads(row["facts"] or "{}")
+    return {"name": row["name"], "shop_name": row["shop_name"], **facts}
+
+
 def save_customer_entry(user_id: str, name: str, amount: float, entry_type: str) -> str:
     """Update a customer's udhaar balance or log a sale. Returns a summary."""
     init_db()

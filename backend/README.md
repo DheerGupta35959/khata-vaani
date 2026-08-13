@@ -176,6 +176,28 @@ Default is Google Gemini. To switch:
 - **Gemini (default):** Set `GOOGLE_API_KEY` in `.env.local`
 - **OpenAI:** Set `OPENAI_API_KEY`, install `livekit-agents[openai]`, and change the `llm=` argument
 
+### PM SVANidhi eligibility dataset
+
+The `check_scheme_eligibility` tool reads a **hand-built local dataset** at
+[`src/scheme_data.json`](src/scheme_data.json) — it is **not a live government
+API**. It summarizes the published PM SVANidhi guidelines:
+
+- Loan tiers (first ₹15,000 / second ₹25,000 / third ₹50,000) and scheme
+  features were confirmed against the official portal
+  [pmsvanidhi.mohua.gov.in](https://pmsvanidhi.mohua.gov.in/) (last updated
+  07-08-2026).
+- Vendor-type requirements and the document checklist follow the PM SVANidhi
+  operational guidelines issued by the Ministry of Housing and Urban Affairs
+  (MoHUA).
+
+Because this is a hand-curated snapshot, amounts and rules may drift from the
+live scheme. The agent is instructed to always state the dataset date and that
+final approval happens through the official channel, and to refuse an
+assessment if the dataset fails to load.
+
+To update the criteria, edit `src/scheme_data.json` and re-run
+`uv run python src/scheme.py` (self-check).
+
 ## Testing
 
 The project includes an eval suite based on the LiveKit Agents [testing framework](https://docs.livekit.io/agents/build/testing/):

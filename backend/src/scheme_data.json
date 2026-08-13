@@ -1,0 +1,53 @@
+{
+  "scheme": {
+    "name": "PM Street Vendor's AtmaNirbhar Nidhi (PM SVANidhi)",
+    "as_of_date": "2026-08-07",
+    "source": "PM SVANidhi official portal (https://pmsvanidhi.mohua.gov.in/, last updated 07-08-2026) and PM SVANidhi operational guidelines issued by the Ministry of Housing and Urban Affairs. This is a hand-built local summary, not a live government API."
+  },
+  "eligibility": {
+    "who": [
+      "Street vendors vending in urban areas (municipal corporation areas and census towns)",
+      "Vending on or before 1 May 2020, or covered by a later Urban Local Body (ULB) survey",
+      "Covered under the Street Vendors (Protection of Livelihood and Regulation of Street Vending) Act, 2014",
+      "The shopkeeper's State/UT must have notified the scheme rules under the Act"
+    ],
+    "certificate_required": true,
+    "documents": [
+      "Certificate of Vending issued by the Urban Local Body, OR a Letter of Recommendation (LoR) if the vendor does not have a certificate",
+      "Identity proof (any one): Aadhaar, Voter ID, Driving Licence, PAN card, Ration card, or Passport",
+      "Residence proof of one year (address on ID or a utility bill)",
+      "Vending / business proof of one year",
+      "Own bank account passbook or statement",
+      "Passport-size photograph",
+      "Mobile number linked to Aadhaar (needed for the online application)"
+    ]
+  },
+  "loan_tiers": [
+    {
+      "tier": 1,
+      "label": "First loan",
+      "max_amount": 15000,
+      "requirement": "First-ever PM SVANidhi working capital loan for an eligible street vendor"
+    },
+    {
+      "tier": 2,
+      "label": "Second loan",
+      "max_amount": 25000,
+      "requirement": "First loan repaid on time"
+    },
+    {
+      "tier": 3,
+      "label": "Third loan",
+      "max_amount": 50000,
+      "requirement": "Second loan repaid on time; the PM SVANidhi Credit Card is also available to vendors who repaid their second loan"
+    }
+  ],
+  "terms": {
+    "tenure_months": 12,
+    "collateral": "None (collateral-free)",
+    "processing_fee": "None",
+    "interest_subsidy_pct": 7,
+    "interest_subsidy_note": "7% per annum interest subsidy credited quarterly on timely or early repayment",
+    "digital_incentives": "Cashback incentives for digital transactions"
+  }
+}

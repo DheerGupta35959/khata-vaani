@@ -20,6 +20,7 @@ from livekit.plugins import deepgram, google, murf, noise_cancellation, silero
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
 import khata_memory
+import scheme
 
 logger = logging.getLogger("agent")
 
@@ -67,11 +68,18 @@ languages.
 
 GUARDRAILS
 - Never ask for OTP, PIN, UPI ID, or account/card numbers, under any framing.
+- You may check published eligibility criteria for a government scheme and
+  report a document checklist. You must never say a scheme, loan, or
+  credit line is "approved" - only that criteria are met or not met, and
+  always add that final approval happens through the scheme's official
+  channel, not through you.
+- Whenever you give any loan-scheme eligibility result, always say out loud
+  that it is based on published guidelines as of the dataset's date, that it
+  is not a live government check, and that final approval happens only
+  through the official channel.
 - Never store account numbers, card numbers, or any government ID numbers
   (Aadhaar, PAN, etc.) in any saved record, even if the shopkeeper offers
   them.
-- Never confirm a loan, credit line, or scheme approval - you only log what
-  you're told, you don't verify or approve anything financial.
 - Never advise whether the shopkeeper should extend more credit to a
   customer - that's their call.
 - If asked anything outside logging sales/udhaar or recalling what's logged
@@ -87,6 +95,14 @@ handler covers re-prompting - don't add your own "are you there" logic here."""
 class Assistant(Agent):
     def __init__(self) -> None:
         super().__init__(instructions=SYSTEM_PROMPT)
+
+    @staticmethod
+    def _user_id(context: RunContext) -> str:
+        """Resolve the caller's id; falls back to 'unknown' when userdata is unset."""
+        try:
+            return (context.userdata or {}).get("user_id", "unknown")
+        except Exception:
+            return "unknown"
 
     @function_tool
     async def lookup_caller(
@@ -110,7 +126,7 @@ class Assistant(Agent):
             shop_name: The shop name, if they just told you it. It will be
                 remembered for next time.
         """
-        resolved_id = user_id or (context.userdata or {}).get("user_id", "unknown")
+        resolved_id = user_id or self._user_id(context)
         if name or shop_name:
             khata_memory.remember_profile(
                 resolved_id, name=name, shop_name=shop_name
@@ -133,7 +149,7 @@ class Assistant(Agent):
             amount: Amount in rupees.
             entry_type: "udhaar" or "sale".
         """
-        user_id = (context.userdata or {}).get("user_id", "unknown")
+        user_id = self._user_id(context)
         logger.info(
             "save_customer_entry user=%s type=%s name=%s amount=%s",
             user_id,
@@ -142,6 +158,30 @@ class Assistant(Agent):
             amount,
         )
         return khata_memory.save_customer_entry(user_id, name, amount, entry_type)
+
+    @function_tool
+    async def check_scheme_eligibility(
+        self,
+        context: RunContext,
+        vending_certificate: bool | None = None,
+        previous_loans: int | None = None,
+    ):
+        """Check whether the shopkeeper likely qualifies for the PM SVANidhi street-vendor loan scheme, and which loan tier applies.
+
+        Use when the shopkeeper asks things like "can I get a loan", "am I eligible for any government scheme", "which loan can I get", or "what documents do I need". Uses the shopkeeper's saved khata profile (sales activity) where available instead of re-asking. Returns an eligibility assessment, the likely loan tier (first/second/third) with the amount, and the document checklist.
+
+        Args:
+            vending_certificate: Whether the shopkeeper has a vending certificate or letter of recommendation, if they have told you.
+            previous_loans: How many PM SVANidhi loans they have already taken and repaid, if they have told you.
+        """
+        user_id = self._user_id(context)
+        logger.info("check_scheme_eligibility user=%s", user_id)
+        profile = khata_memory.get_profile(user_id)
+        return scheme.check_eligibility(
+            profile,
+            vending_certificate=vending_certificate,
+            previous_loans=previous_loans,
+        )
 
 
 server = AgentServer()
