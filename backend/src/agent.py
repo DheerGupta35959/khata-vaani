@@ -1,5 +1,7 @@
 import asyncio
+import json
 import logging
+import os
 import time
 
 from dotenv import load_dotenv
@@ -16,10 +18,12 @@ from livekit.agents import (
     room_io,
     tokenize,
 )
+from livekit.agents.llm import ChatContext
 from livekit.plugins import deepgram, google, murf, noise_cancellation, silero
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
 import khata_memory
+import outcome_log
 import scheme
 
 logger = logging.getLogger("agent")
@@ -29,6 +33,15 @@ load_dotenv(".env.local")
 # Khata-Vaani — voice bookkeeping agent for Indian shopkeepers.
 silent_nudge = "Still there? Go ahead whenever you're ready."
 silent_close = "It's been quiet, so I'll close up now. Take care, bye!"
+
+# Outbound call tuning
+VOICEMAIL_WAIT_S = 8.0  # no user speech this long after STT active → voicemail
+HANGUP_WINDOW_S = (
+    6.0  # hangup within this window of answering → immediate_hangup (opt-out)
+)
+RINGING_TIMEOUT_S = 30.0
+RETRY_DELAY_S = 10.0  # pause before the one retry after no-answer/busy
+_SIP_IDENTITY = "phone-user"
 
 SYSTEM_PROMPT = """IDENTITY
 You are Khata-Vaani, a voice assistant that helps small shopkeepers in India
@@ -82,6 +95,10 @@ GUARDRAILS
   them.
 - Never advise whether the shopkeeper should extend more credit to a
   customer - that's their call.
+- Never place an outbound call to a shopkeeper unless they explicitly agreed
+  to be called back during a prior session (recorded via set_call_consent). If
+  no such consent is on record, do not call - surface the reminder only the
+  next time they call in.
 - If asked anything outside logging sales/udhaar or recalling what's logged
   (loan advice, investments, payments), say: "That's outside what I handle -
   I just help you keep track of your khata." Then stop, don't improvise.
@@ -92,9 +109,71 @@ a screen - this gets spoken aloud. If the user goes silent, the silence
 handler covers re-prompting - don't add your own "are you there" logic here."""
 
 
+OUTBOUND_PROMPT = """IDENTITY
+You are Khata-Vaani, calling a shopkeeper to remind them about a scheme or
+loan application deadline. You work for the shopkeeper, not any bank or lender.
+
+TASK
+1. After the opening line, listen. If they sound confused, repeat that this is
+   Khata-Vaani calling about their loan application deadline.
+2. If they say "stop", "don't call again", "mat karo", or similar, end the
+   call immediately and call set_call_consent with consent=false.
+3. Never discuss loan amounts, bank details, or payment links over the phone.
+4. Keep it short. One reminder, then wrap up politely and say goodbye.
+
+LANGUAGE
+Mirror the user. Keep sentences short - this is spoken, not read.
+
+GUARDRAILS
+- Never ask for OTP, PIN, UPI ID, or account/card numbers.
+- If they want to discuss eligibility or documents, tell them to call back in
+  and say "scheme" - Khata-Vaani can help in their next session."""
+
+
+def outbound_opening_line(deadline: str) -> str:
+    """Two-sentence opening line: who we are, why we called, and how to opt out."""
+    return (
+        f"Namaste, this is Khata-Vaani calling to remind you about your loan "
+        f"application deadline on {deadline}. Say stop and I won't call again."
+    )
+
+
+def _job_metadata(ctx: JobContext) -> dict:
+    """Parse the dispatch metadata dict set by run_outbound.py."""
+    meta = getattr(ctx.job, "metadata", None)
+    if not meta:
+        return {}
+    try:
+        return json.loads(meta)
+    except (json.JSONDecodeError, AttributeError, TypeError):
+        return {}
+
+
+def _is_stop_request(text: str) -> bool:
+    text = text.lower()
+    return any(
+        w in text
+        for w in (
+            "stop",
+            "don't call",
+            "dont call",
+            "call mat",
+            "mat karo",
+            "band karo",
+            "no call",
+        )
+    )
+
+
 class Assistant(Agent):
-    def __init__(self) -> None:
-        super().__init__(instructions=SYSTEM_PROMPT)
+    def __init__(
+        self, instructions: str = SYSTEM_PROMPT, opening_line: str | None = None
+    ) -> None:
+        chat_ctx = None
+        if opening_line:
+            chat_ctx = ChatContext()
+            chat_ctx.add_message(role="assistant", content=opening_line)
+        super().__init__(instructions=instructions, chat_ctx=chat_ctx)
 
     @staticmethod
     def _user_id(context: RunContext) -> str:
@@ -128,9 +207,7 @@ class Assistant(Agent):
         """
         resolved_id = user_id or self._user_id(context)
         if name or shop_name:
-            khata_memory.remember_profile(
-                resolved_id, name=name, shop_name=shop_name
-            )
+            khata_memory.remember_profile(resolved_id, name=name, shop_name=shop_name)
         logger.info("lookup_caller user=%s", resolved_id)
         return khata_memory.lookup_caller(resolved_id)
 
@@ -183,8 +260,211 @@ class Assistant(Agent):
             previous_loans=previous_loans,
         )
 
+    @function_tool
+    async def set_call_consent(
+        self, context: RunContext, consent: bool, phone: str | None = None
+    ):
+        """Record whether the shopkeeper explicitly agreed to receive outbound reminder calls.
+
+        Only call when they explicitly agree to being called about a scheme or loan
+        deadline. Their phone number is required to say yes. If they say stop, don't
+        call again, or hang up immediately, call this with consent=false to revoke.
+
+        Args:
+            consent: True if they explicitly agreed to receive calls, False to revoke.
+            phone: Their phone number in E.164 format (e.g. +919876543210), required to consent.
+        """
+        user_id = self._user_id(context)
+        logger.info("set_call_consent user=%s consent=%s", user_id, consent)
+        if consent and not phone:
+            return "I need their phone number before I can set up call reminders."
+        return khata_memory.set_call_consent(user_id, consent, phone=phone)
+
+    @function_tool
+    async def schedule_reminder_call(
+        self, context: RunContext, deadline: str, reason: str
+    ):
+        """Queue an outbound reminder call before a scheme or loan application deadline.
+
+        Call only after the shopkeeper explicitly agreed to be called and set_call_consent
+        succeeded. If no consent is on record this refuses - surface the reminder in-session
+        instead of scheduling a call.
+
+        Args:
+            deadline: Application deadline as an ISO date (YYYY-MM-DD).
+            reason: Why they should be reminded, e.g. "PM SVANidhi application deadline".
+        """
+        user_id = self._user_id(context)
+        logger.info("schedule_reminder_call user=%s deadline=%s", user_id, deadline)
+        return khata_memory.schedule_reminder(user_id, deadline, reason)
+
 
 server = AgentServer()
+
+
+async def _dial_with_retry(
+    ctx: JobContext, meta: dict, phone_number: str
+) -> tuple[bool, str]:
+    """Place the SIP call; retry once after RETRY_DELAY_S on no-answer/busy."""
+    from livekit import api as lk_api
+
+    trunk_id = os.environ.get("LIVEKIT_SIP_OUTBOUND_TRUNK_ID", "")
+    if not trunk_id:
+        logger.error("LIVEKIT_SIP_OUTBOUND_TRUNK_ID not set - cannot dial outbound")
+        return False, "config_error"
+
+    user_id = meta.get("user_id", "unknown")
+    if not khata_memory.has_call_consent(user_id):
+        logger.warning("No consent on record for %s - not dialing", user_id)
+        return False, "no_consent"
+
+    lk = lk_api.LiveKitAPI(
+        url=os.environ["LIVEKIT_URL"],
+        api_key=os.environ["LIVEKIT_API_KEY"],
+        api_secret=os.environ["LIVEKIT_API_SECRET"],
+    )
+    last_reason = "no_answer"
+    try:
+        for attempt in (1, 2):
+            logger.info(
+                "Dialing %s (trunk %s), attempt %d...", phone_number, trunk_id, attempt
+            )
+            try:
+                await lk.sip.create_sip_participant(
+                    lk_api.CreateSIPParticipantRequest(
+                        sip_trunk_id=trunk_id,
+                        sip_call_to=phone_number,
+                        room_name=ctx.room.name,
+                        participant_identity=_SIP_IDENTITY,
+                        wait_until_answered=True,
+                        ringing_timeout=RINGING_TIMEOUT_S,
+                    )
+                )
+                return True, "answered"
+            except Exception as exc:
+                last_reason = "busy" if "busy" in str(exc).lower() else "no_answer"
+                logger.warning("Attempt %d failed (%s): %s", attempt, last_reason, exc)
+                if attempt == 1:
+                    await asyncio.sleep(RETRY_DELAY_S)
+        return False, last_reason
+    finally:
+        await lk.aclose()
+
+
+async def _greet_answered_call(
+    ctx: JobContext, session: AgentSession, opening_line: str
+) -> rtc.RemoteParticipant | None:
+    """Wait for the answered SIP participant, then play the opening line before STT."""
+    participant = ctx.room.remote_participants.get(_SIP_IDENTITY)
+    if participant is None:
+        try:
+            participant = await asyncio.wait_for(
+                ctx.wait_for_participant(), timeout=5.0
+            )
+        except asyncio.TimeoutError:
+            logger.error("SIP participant didn't appear after answering")
+            return None
+
+    track_ready = asyncio.Event()
+
+    def _on_track_subscribed(track, _pub, remote_participant):
+        if (
+            remote_participant.identity == participant.identity
+            and track.kind == rtc.TrackKind.KIND_AUDIO
+        ):
+            track_ready.set()
+
+    ctx.room.on("track_subscribed", _on_track_subscribed)
+    for pub in participant.track_publications.values():
+        if pub.subscribed and pub.track and pub.track.kind == rtc.TrackKind.KIND_AUDIO:
+            track_ready.set()
+            break
+    try:
+        await asyncio.wait_for(track_ready.wait(), timeout=3.0)
+    except asyncio.TimeoutError:
+        logger.warning("Caller audio track not detected in 3s (proceeding)")
+    finally:
+        ctx.room.off("track_subscribed", _on_track_subscribed)
+
+    await asyncio.sleep(0.7)
+
+    handle = session.say(opening_line, allow_interruptions=False)
+    await asyncio.wait_for(handle.wait_for_playout(), timeout=60.0)
+    session.room_io.set_participant(participant.identity)
+    return participant
+
+
+async def _handle_outbound_outcomes(
+    ctx: JobContext,
+    session: AgentSession,
+    meta: dict,
+    participant: rtc.RemoteParticipant,
+    answer_t: float,
+) -> None:
+    """Classify and log the call outcome; revoke consent on stop / immediate hangup."""
+    user_id = meta.get("user_id", "unknown")
+    reminder_id = meta.get("reminder_id")
+
+    stop_seen = asyncio.Event()
+    disconnected = asyncio.Event()
+    first_speech = asyncio.Event()
+
+    def _on_user_input(ev):
+        if ev.is_final and ev.transcript:
+            first_speech.set()
+            if _is_stop_request(ev.transcript):
+                stop_seen.set()
+
+    def _on_disconnected(*_):
+        disconnected.set()
+
+    session.on("user_input_transcribed", _on_user_input)
+    ctx.room.on("disconnected", _on_disconnected)
+
+    def _finish(outcome: str) -> None:
+        logger.info("OUTBOUND outcome: %s", outcome)
+        outcome_log.log_call(meta, outcome)
+        if reminder_id:
+            status = {"opted_out": "opted_out", "voicemail": "voicemail"}.get(
+                outcome, "called"
+            )
+            khata_memory.mark_reminder(reminder_id, status)
+        if outcome in ("opted_out", "immediate_hangup"):
+            khata_memory.set_call_consent(user_id, False)
+        if outcome in ("opted_out", "immediate_hangup", "voicemail"):
+            session.shutdown()
+
+    # Wait for first user speech OR hangup, up to the voicemail window.
+    # ponytail: no AMD on the LiveKit trunk path - "no speech for VOICEMAIL_WAIT_S"
+    # is the voicemail heuristic; add AMD later if misclassification shows up.
+    await asyncio.wait(
+        {first_speech.wait(), disconnected.wait()},
+        timeout=VOICEMAIL_WAIT_S,
+        return_when=asyncio.FIRST_COMPLETED,
+    )
+    if disconnected.is_set():
+        if time.monotonic() - answer_t < HANGUP_WINDOW_S:
+            _finish("immediate_hangup")
+        else:
+            _finish("completed")
+        return
+    if stop_seen.is_set():
+        _finish("opted_out")
+        return
+    if not first_speech.is_set():
+        _finish("voicemail")
+        return
+
+    # They spoke - keep listening for "stop" or hangup until the call ends.
+    while not stop_seen.is_set() and not disconnected.is_set():
+        await asyncio.wait(
+            {stop_seen.wait(), disconnected.wait()},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+    if stop_seen.is_set():
+        _finish("opted_out")
+    else:
+        _finish("completed")
 
 
 def prewarm(proc: JobProcess):
@@ -202,6 +482,15 @@ async def my_agent(ctx: JobContext):
         "room": ctx.room.name,
     }
 
+    job_meta = _job_metadata(ctx)
+    outbound_phone = job_meta.get("phone_number")
+    opening_line = (
+        outbound_opening_line(job_meta.get("deadline", "soon"))
+        if outbound_phone
+        else None
+    )
+    instructions = OUTBOUND_PROMPT if outbound_phone else SYSTEM_PROMPT
+
     # Set up a voice AI pipeline using Murf Falcon, Gemini, Deepgram, and the LiveKit turn detector
     session = AgentSession(
         # Speech-to-text (STT) is your agent's ears, turning the user's speech into text that the LLM can understand
@@ -212,17 +501,17 @@ async def my_agent(ctx: JobContext):
         # A Large Language Model (LLM) is your agent's brain, processing user input and generating a response
         # See all available models at https://docs.livekit.io/agents/models/llm/
         llm=google.LLM(
-                model="gemini-3.5-flash-lite",
-            ),
+            model="gemini-3.5-flash-lite",
+        ),
         # Text-to-speech (TTS) is your agent's voice, turning the LLM's text into speech that the user can hear
         # See all available models as well as voice selections at https://docs.livekit.io/agents/models/tts/
         tts=murf.TTS(
-                voice="Pooja",  # en-IN Indian English (Falcon 2) — Murf voice library
-                locale="en-IN",
-                style="Conversation",
-                tokenizer=tokenize.basic.SentenceTokenizer(min_sentence_len=2),
-                text_pacing=True
-            ),
+            voice="Pooja",  # en-IN Indian English (Falcon 2) — Murf voice library
+            locale="en-IN",
+            style="Conversation",
+            tokenizer=tokenize.basic.SentenceTokenizer(min_sentence_len=2),
+            text_pacing=True,
+        ),
         # VAD and turn detection are used to determine when the user is speaking and when the agent should respond
         # See more at https://docs.livekit.io/agents/build/turns
         turn_detection=MultilingualModel(),
@@ -308,7 +597,7 @@ async def my_agent(ctx: JobContext):
 
     # Start the session, which initializes the voice pipeline and warms up the models
     await session.start(
-        agent=Assistant(),
+        agent=Assistant(instructions=instructions, opening_line=opening_line),
         room=ctx.room,
         room_options=room_io.RoomOptions(
             audio_input=room_io.AudioInputOptions(
@@ -326,8 +615,34 @@ async def my_agent(ctx: JobContext):
     await ctx.connect()
 
     # Persist the caller's identity so the memory tools can key the ledger on it
-    remote = next(iter(ctx.room.remote_participants)) if ctx.room.remote_participants else "unknown"
-    session.userdata = {"user_id": remote}
+    if outbound_phone:
+        session.userdata = {"user_id": job_meta.get("user_id", "unknown")}
+    else:
+        remote = (
+            next(iter(ctx.room.remote_participants))
+            if ctx.room.remote_participants
+            else "unknown"
+        )
+        session.userdata = {"user_id": remote}
+
+    # Outbound: dial, greet, then observe outcomes (voicemail / opt-out / hangup).
+    if outbound_phone:
+        ok, dial_outcome = await _dial_with_retry(ctx, job_meta, outbound_phone)
+        if not ok:
+            logger.warning("Dial failed: %s", dial_outcome)
+            outcome_log.log_call(job_meta, dial_outcome)
+            if job_meta.get("reminder_id"):
+                khata_memory.mark_reminder(job_meta["reminder_id"], "failed")
+            session.shutdown()
+            return
+        participant = await _greet_answered_call(ctx, session, opening_line)
+        if participant is None:
+            outcome_log.log_call(job_meta, "no_participant")
+            session.shutdown()
+            return
+        await _handle_outbound_outcomes(
+            ctx, session, job_meta, participant, time.monotonic()
+        )
 
 
 if __name__ == "__main__":

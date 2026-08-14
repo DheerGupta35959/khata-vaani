@@ -198,6 +198,70 @@ assessment if the dataset fails to load.
 To update the criteria, edit `src/scheme_data.json` and re-run
 `uv run python src/scheme.py` (self-check).
 
+## Outbound calls (reminders)
+
+The agent can place outbound reminder calls before a scheme/loan application
+deadline — **only** when the shopkeeper explicitly consented to be called
+during a session (`set_call_consent`) and left a phone number. Without consent
+on record the agent refuses to dial and the reminder surfaces the next time
+the shopkeeper calls in.
+
+### 1. Twilio setup (console.twilio.com, once)
+
+1. Elastic SIP Trunking → Trunks → Create new SIP Trunk (name: "LiveKit Outbound").
+2. Open the trunk → Termination tab → Enable termination. Pick a unique SIP URI
+   subdomain, e.g. `livekit-outbound.pstn.twilio.com`. Save.
+3. Termination → Credential Lists → create a credential list (`livekit-creds`)
+   with a username + password, then attach it to the trunk's Termination tab.
+
+Add to `.env.local`:
+```
+TWILIO_SIP_TERM_URI=livekit-outbound.pstn.twilio.com
+TWILIO_SIP_USERNAME=<credential username>
+TWILIO_SIP_PASSWORD=<credential password>
+TWILIO_PHONE_NUMBER=+12015551234
+```
+
+### 2. Create the LiveKit outbound trunk (once)
+
+```bash
+uv run python scripts/setup_outbound_trunk.py
+```
+Copy the printed trunk ID into `.env.local`:
+```
+LIVEKIT_SIP_OUTBOUND_TRUNK_ID=KT_xxxxxxxxxxxxxxxx
+```
+
+### 3. Trigger a test call to your own number
+
+Start the agent worker (it must be running for a dispatch to be picked up):
+
+```bash
+uv run python src/agent.py dev
+```
+
+In a second terminal, record consent for a test user and dispatch a call:
+
+```bash
+# Simulates the in-session consent + phone the shopkeeper would give out loud
+uv run python src/run_outbound.py seed-consent --user test --phone +919876543210
+
+# Schedule + dial a reminder for that deadline
+uv run python src/run_outbound.py call --user test --deadline 2026-08-31 --reason "PM SVANidhi application deadline"
+```
+
+Your phone rings in ~5s. The opening line identifies Khata-Vaani and the
+deadline, and says "Say stop and I won't call again." Outcomes (answered,
+voicemail, opted_out, immediate_hangup, no_answer, busy) are appended to
+`logs/outbound_calls.jsonl`; reminders are tracked in `khata.db`. "stop" or an
+immediate hang-up revokes consent, so no further calls are placed.
+
+List pending reminders due within the week:
+
+```bash
+uv run python src/run_outbound.py due
+```
+
 ## Testing
 
 The project includes an eval suite based on the LiveKit Agents [testing framework](https://docs.livekit.io/agents/build/testing/):

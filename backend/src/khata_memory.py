@@ -9,12 +9,14 @@ import json
 import os
 import sqlite3
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 # Override with KHATA_DB_PATH env var for tests / custom locations.
-DB_PATH = Path(os.environ.get("KHATA_DB_PATH", Path(__file__).resolve().parent.parent / "khata.db"))
+DB_PATH = Path(
+    os.environ.get("KHATA_DB_PATH", Path(__file__).resolve().parent.parent / "khata.db")
+)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
@@ -22,8 +24,19 @@ CREATE TABLE IF NOT EXISTS users (
     name TEXT,
     shop_name TEXT,
     language_preference TEXT,
+    phone TEXT,
+    call_consent INTEGER NOT NULL DEFAULT 0,
     facts TEXT NOT NULL DEFAULT '{}',
     last_interaction TEXT
+);
+CREATE TABLE IF NOT EXISTS reminders (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id TEXT NOT NULL,
+    phone TEXT NOT NULL,
+    deadline TEXT NOT NULL,
+    reason TEXT,
+    status TEXT NOT NULL DEFAULT 'pending',
+    created_at TEXT
 )
 """
 
@@ -48,9 +61,21 @@ def _db():
         conn.close()
 
 
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Add columns introduced after the initial CREATE TABLE (existing DBs)."""
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(users)")}
+    if "phone" not in cols:
+        conn.execute("ALTER TABLE users ADD COLUMN phone TEXT")
+    if "call_consent" not in cols:
+        conn.execute(
+            "ALTER TABLE users ADD COLUMN call_consent INTEGER NOT NULL DEFAULT 0"
+        )
+
+
 def init_db() -> None:
     with _db() as conn:
-        conn.execute(_SCHEMA)
+        conn.executescript(_SCHEMA)
+        _migrate(conn)
 
 
 def lookup_caller(user_id: str) -> str:
@@ -58,11 +83,13 @@ def lookup_caller(user_id: str) -> str:
     init_db()
     with _db() as conn:
         row = conn.execute(
-            "SELECT name, shop_name, language_preference, facts FROM users WHERE user_id = ?",
+            "SELECT name, shop_name, language_preference, phone, call_consent, facts "
+            "FROM users WHERE user_id = ?",
             (user_id,),
         ).fetchone()
         conn.execute(
-            "UPDATE users SET last_interaction = ? WHERE user_id = ?", (_now_iso(), user_id)
+            "UPDATE users SET last_interaction = ? WHERE user_id = ?",
+            (_now_iso(), user_id),
         )
         if row is None:
             conn.execute(
@@ -78,6 +105,8 @@ def lookup_caller(user_id: str) -> str:
             "name": row["name"],
             "shop_name": row["shop_name"],
             "language_preference": row["language_preference"],
+            "phone": row["phone"],
+            "call_consent": bool(row["call_consent"]),
             "usual_items_sold": facts.get("usual_items_sold", []),
             "customers": sorted(
                 (
@@ -112,7 +141,9 @@ def remember_profile(user_id: str, *, name: str | None, shop_name: str | None) -
     values.append(_now_iso())
     values.append(user_id)
     with _db() as conn:
-        conn.execute("INSERT OR IGNORE INTO users (user_id, facts) VALUES (?, '{}')", (user_id,))
+        conn.execute(
+            "INSERT OR IGNORE INTO users (user_id, facts) VALUES (?, '{}')", (user_id,)
+        )
         conn.execute(f"UPDATE users SET {', '.join(fields)} WHERE user_id = ?", values)
 
 
@@ -121,12 +152,19 @@ def get_profile(user_id: str) -> dict:
     init_db()
     with _db() as conn:
         row = conn.execute(
-            "SELECT name, shop_name, facts FROM users WHERE user_id = ?", (user_id,)
+            "SELECT name, shop_name, phone, call_consent, facts FROM users WHERE user_id = ?",
+            (user_id,),
         ).fetchone()
     if row is None:
         return {}
     facts = json.loads(row["facts"] or "{}")
-    return {"name": row["name"], "shop_name": row["shop_name"], **facts}
+    return {
+        "name": row["name"],
+        "shop_name": row["shop_name"],
+        "phone": row["phone"],
+        "call_consent": bool(row["call_consent"]),
+        **facts,
+    }
 
 
 def save_customer_entry(user_id: str, name: str, amount: float, entry_type: str) -> str:
@@ -134,7 +172,9 @@ def save_customer_entry(user_id: str, name: str, amount: float, entry_type: str)
     init_db()
     now = _now_iso()
     with _db() as conn:
-        row = conn.execute("SELECT facts FROM users WHERE user_id = ?", (user_id,)).fetchone()
+        row = conn.execute(
+            "SELECT facts FROM users WHERE user_id = ?", (user_id,)
+        ).fetchone()
         if row is None:
             conn.execute(
                 "INSERT INTO users (user_id, facts, last_interaction) VALUES (?, '{}', ?)",
@@ -149,8 +189,12 @@ def save_customer_entry(user_id: str, name: str, amount: float, entry_type: str)
 
         if entry_type == "udhaar":
             key = name.strip().lower()
-            cust = customers.setdefault(key, {"udhaar_balance": 0.0, "last_updated": now})
-            cust["udhaar_balance"] = round(cust.get("udhaar_balance", 0.0) + float(amount), 2)
+            cust = customers.setdefault(
+                key, {"udhaar_balance": 0.0, "last_updated": now}
+            )
+            cust["udhaar_balance"] = round(
+                cust.get("udhaar_balance", 0.0) + float(amount), 2
+            )
             cust["last_updated"] = now
             saved = f"Udhaar saved: {name.strip()} now owes Rs. {cust['udhaar_balance']} in total."
         elif entry_type == "sale":
@@ -166,12 +210,93 @@ def save_customer_entry(user_id: str, name: str, amount: float, entry_type: str)
     return saved
 
 
+def set_call_consent(user_id: str, consent: bool, phone: str | None = None) -> str:
+    """Record explicit in-session consent to receive outbound reminder calls."""
+    init_db()
+    with _db() as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO users (user_id, facts) VALUES (?, '{}')", (user_id,)
+        )
+        conn.execute(
+            "UPDATE users SET call_consent = ?, phone = COALESCE(?, phone), last_interaction = ? "
+            "WHERE user_id = ?",
+            (1 if consent else 0, phone, _now_iso(), user_id),
+        )
+    return "Consent to call recorded." if consent else "Consent to call revoked."
+
+
+def has_call_consent(user_id: str) -> bool:
+    """True only when the shopkeeper consented AND left a phone number."""
+    init_db()
+    with _db() as conn:
+        row = conn.execute(
+            "SELECT call_consent, phone FROM users WHERE user_id = ?", (user_id,)
+        ).fetchone()
+    return bool(row and row["call_consent"] and row["phone"])
+
+
+def schedule_reminder(user_id: str, deadline: str, reason: str) -> str:
+    """Queue an outbound reminder call. Refuses without recorded consent + phone."""
+    init_db()
+    with _db() as conn:
+        row = conn.execute(
+            "SELECT call_consent, phone FROM users WHERE user_id = ?", (user_id,)
+        ).fetchone()
+        if not (row and row["call_consent"] and row["phone"]):
+            return "No consent to call on record - reminder will surface next session instead."
+        conn.execute(
+            "INSERT INTO reminders (user_id, phone, deadline, reason, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (user_id, row["phone"], deadline, reason, _now_iso()),
+        )
+    return "Reminder call scheduled."
+
+
+def due_reminders(within_days: int = 7) -> list[dict]:
+    """Pending reminders whose deadline is within `within_days` (or already past)."""
+    init_db()
+    cutoff = (datetime.now(timezone.utc) + timedelta(days=within_days)).isoformat(
+        timespec="seconds"
+    )
+    with _db() as conn:
+        rows = conn.execute(
+            "SELECT id, user_id, phone, deadline, reason, status FROM reminders "
+            "WHERE status = 'pending' AND deadline <= ? ORDER BY deadline",
+            (cutoff,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def mark_reminder(reminder_id: int, status: str) -> None:
+    """Update a reminder's status (called, opted_out, failed, skipped)."""
+    init_db()
+    with _db() as conn:
+        conn.execute(
+            "UPDATE reminders SET status = ? WHERE id = ?", (status, reminder_id)
+        )
+
+
+def latest_reminder(user_id: str) -> dict | None:
+    """Return the most recent reminder row for a user, if any."""
+    init_db()
+    with _db() as conn:
+        row = conn.execute(
+            "SELECT id, user_id, phone, deadline, reason, status FROM reminders "
+            "WHERE user_id = ? ORDER BY id DESC LIMIT 1",
+            (user_id,),
+        ).fetchone()
+    return dict(row) if row else None
+
+
 if __name__ == "__main__":
     import tempfile
 
     DB_PATH = Path(tempfile.mkdtemp()) / "selfcheck.db"
 
-    assert lookup_caller("u1") == "This shopkeeper is new - no saved profile or ledger yet."
+    assert (
+        lookup_caller("u1")
+        == "This shopkeeper is new - no saved profile or ledger yet."
+    )
     assert "owes Rs. 150" in save_customer_entry("u1", "Ram", 150, "udhaar")
     assert "owes Rs. 200" in save_customer_entry("u1", "Ram", 50, "udhaar")
     assert "logged" in save_customer_entry("u1", "hair oil", 120, "sale")
@@ -183,5 +308,20 @@ if __name__ == "__main__":
     assert "hair oil" in led
     # second call proves it persisted across connections
     assert lookup_caller("u1") == led
+    # consent + reminders
+    assert "Consent to call recorded." in set_call_consent(
+        "u1", True, phone="+919876543210"
+    )
+    assert has_call_consent("u1")
+    assert "Consent to call revoked." in set_call_consent("u1", False)
+    assert not has_call_consent("u1")
+    set_call_consent("u1", True, phone="+919876543210")
+    assert "scheduled" in schedule_reminder("u1", "2026-08-31", "SVANidhi deadline")
+    due = due_reminders(within_days=365)
+    assert len(due) == 1 and due[0]["phone"] == "+919876543210"
+    mark_reminder(due[0]["id"], "called")
+    assert due_reminders(within_days=365) == []
+    # no consent -> refuses to schedule
+    set_call_consent("u1", False)
+    assert "No consent" in schedule_reminder("u1", "2026-08-31", "SVANidhi deadline")
     print(f"self-check OK -> {DB_PATH}")
-
