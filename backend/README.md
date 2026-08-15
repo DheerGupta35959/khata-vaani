@@ -262,6 +262,42 @@ List pending reminders due within the week:
 uv run python src/run_outbound.py due
 ```
 
+## Human escalation (Discord)
+
+When a shopkeeper reports suspected fraud (fake currency, suspicious
+payment/OTP requests, someone impersonating a bank or scheme official) or asks
+for a judgment call the agent is not allowed to make (write off a debt, extend
+more credit), the agent offers to escalate. It says out loud what it will send,
+asks permission, and only then calls `create_escalation` — which posts a
+formatted message to a Discord channel webhook and saves the record to the
+`escalations` table in `khata.db` for later status tracking.
+
+Set up the webhook once:
+
+1. In Discord: open the channel → Settings → Integrations → Webhooks →
+   Create Webhook → Copy Webhook URL.
+2. Add it to `.env.local`:
+   ```
+   DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/<id>/<token>
+   ```
+
+Each escalation gets a speakable reference id (e.g. `KV-4821`), which the
+agent reads back and the team can use to track status. Duplicate prevention:
+an open escalation with a similar `what_happened` for the same shopkeeper is
+updated instead of creating a new one. OTP, PIN, account/card, Aadhaar, and
+PAN numbers are stripped from every field before sending.
+
+To verify the Discord message lands, run a session (`uv run python src/agent.py
+dev`) and tell the agent something like "a bank officer asked for my OTP" and
+confirm the escalation when asked — the message appears in the channel within a
+few seconds. For a no-app-flow check, you can POST directly to the webhook:
+
+```bash
+curl -H "Content-Type: application/json" \
+  -d '{"content":"webhook test"}' \
+  "$DISCORD_WEBHOOK_URL"
+```
+
 ## Testing
 
 The project includes an eval suite based on the LiveKit Agents [testing framework](https://docs.livekit.io/agents/build/testing/):

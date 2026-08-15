@@ -2,7 +2,10 @@ import asyncio
 import json
 import logging
 import os
+import random
+import re
 import time
+import urllib.request
 
 from dotenv import load_dotenv
 from livekit import rtc
@@ -62,6 +65,17 @@ OBJECTIVES
 4. Answer "who owes me how much" queries from the saved ledger.
 5. If asked for a summary, you may mention outstanding udhaar, but only when
    asked - don't volunteer it unprompted.
+6. Escalate to the team (create_escalation) in exactly two situations:
+   - the shopkeeper reports something that sounds like fraud (fake currency,
+     suspicious payment/OTP requests, someone impersonating a bank or scheme
+     official)
+   - the shopkeeper needs a judgment call you aren't allowed to make (e.g.
+     whether to write off a debt or extend more credit to a customer)
+   Before calling create_escalation, say out loud exactly what you're about to
+   send and ask permission. If the shopkeeper says no, do not call the function.
+7. After a successful escalation, read back the reference_id and give an
+   honest next step - say "a team member will follow up", never a specific
+   time like "someone will call in five minutes".
 
 KNOWLEDGE
 You only know what has been saved in this shopkeeper's khata (SQLite-backed
@@ -163,6 +177,68 @@ def _is_stop_request(text: str) -> bool:
             "no call",
         )
     )
+
+
+_PII_PATTERNS = [
+    re.compile(r"\b[A-Z]{5}\d{4}[A-Z]\b"),  # PAN
+    re.compile(r"\b\d[\d\s-]{4,}\d\b"),  # 6+ digit runs (OTP/account/card/Aadhaar)
+]
+
+
+def _strip_pii(text: str) -> str:
+    """Remove OTP, PIN, account, card, Aadhaar, PAN numbers from free text."""
+    for pattern in _PII_PATTERNS:
+        text = pattern.sub("[redacted]", text)
+    return text
+
+
+def _new_reference_id() -> str:
+    return f"KV-{random.randint(0, 9999):04d}"
+
+
+def _post_discord(summary: dict) -> bool:
+    """POST the escalation to the Discord channel webhook. Returns success."""
+    url = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
+    if not url:
+        logger.error("DISCORD_WEBHOOK_URL not set - escalation not sent to Discord")
+        return False
+    payload = {
+        "content": f"New escalation {summary['reference_id']}",
+        "embeds": [
+            {
+                "title": f"{summary['urgency'].upper()} — {summary['who']}",
+                "description": summary["what_happened"],
+                "fields": [
+                    {
+                        "name": "Reference",
+                        "value": summary["reference_id"],
+                        "inline": True,
+                    },
+                    {"name": "Urgency", "value": summary["urgency"], "inline": True},
+                    {"name": "Status", "value": summary["status"], "inline": True},
+                    {"name": "Language", "value": summary["language"], "inline": True},
+                    {"name": "Already checked", "value": summary["already_checked"]},
+                    {
+                        "name": "Preferred followup",
+                        "value": summary["preferred_followup"],
+                    },
+                    {"name": "Created", "value": summary["created_at"]},
+                ],
+            }
+        ],
+    }
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return resp.status == 204
+    except Exception as exc:
+        logger.error("Discord webhook failed: %s", exc)
+        return False
 
 
 class Assistant(Agent):
@@ -297,6 +373,80 @@ class Assistant(Agent):
         user_id = self._user_id(context)
         logger.info("schedule_reminder_call user=%s deadline=%s", user_id, deadline)
         return khata_memory.schedule_reminder(user_id, deadline, reason)
+
+    @function_tool
+    async def create_escalation(
+        self,
+        context: RunContext,
+        what_happened: str,
+        already_checked: str,
+        urgency: str,
+        preferred_followup: str,
+    ):
+        """Escalate an issue to the Khata-Vaani team.
+
+        Call ONLY after telling the shopkeeper out loud what will be sent and
+        getting their explicit permission. Use for suspected fraud (fake currency,
+        suspicious payment/OTP requests, someone impersonating a bank or scheme
+        official) or a judgment call you are not allowed to make (e.g. whether to
+        write off a debt or extend more credit).
+
+        Args:
+            what_happened: 1-2 sentence summary of the issue.
+            already_checked: What you already tried or advised.
+            urgency: "low", "medium", "high", or "emergency".
+            preferred_followup: How the shopkeeper wants the team to reach them.
+        """
+        user_id = self._user_id(context)
+        profile = khata_memory.get_profile(user_id)
+        who = (
+            f"{profile.get('name', '') or ''} {profile.get('shop_name', '') or ''}".strip()
+            or "Unknown shopkeeper"
+        )
+        summary = {
+            "reference_id": _new_reference_id(),
+            "who": who,
+            "what_happened": _strip_pii(what_happened)[:500],
+            "already_checked": _strip_pii(already_checked)[:500],
+            "urgency": urgency,
+            "language": profile.get("language_preference") or "unknown",
+            "preferred_followup": _strip_pii(preferred_followup)[:200],
+            "status": "open",
+            "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        }
+
+        dup = khata_memory.find_similar_open_escalation(
+            user_id, summary["what_happened"]
+        )
+        if dup:
+            summary["reference_id"] = dup["reference_id"]
+            khata_memory.save_escalation({**summary, "user_id": user_id})
+            logger.info(
+                "Updated escalation %s (dup) user=%s", summary["reference_id"], user_id
+            )
+            return (
+                f"Updated existing escalation {summary['reference_id']}. "
+                "A team member will follow up."
+            )
+
+        khata_memory.save_escalation({**summary, "user_id": user_id})
+        posted = _post_discord(summary)
+        logger.info(
+            "Escalation %s created user=%s urgency=%s discord=%s",
+            summary["reference_id"],
+            user_id,
+            urgency,
+            posted,
+        )
+        if posted:
+            return (
+                f"Escalation {summary['reference_id']} recorded and sent to the team "
+                f"({urgency} urgency). A team member will follow up."
+            )
+        return (
+            f"Escalation {summary['reference_id']} recorded, but the team alert could "
+            "not be delivered right now. It is on file - a team member will follow up."
+        )
 
 
 server = AgentServer()

@@ -10,7 +10,7 @@ os.environ.setdefault(
 )
 
 import khata_memory
-from agent import Assistant, outbound_opening_line
+from agent import Assistant, _strip_pii, outbound_opening_line
 
 # Start each run from a clean, pre-seeded returning-shopkeeper profile.
 if os.path.exists(khata_memory.DB_PATH):
@@ -161,7 +161,9 @@ async def test_scheme_tool_not_fired_on_unrelated() -> None:
             llm,
             intent="""
                 The assistant is handling the sale logging request - it asks for the missing
-                item name or other sale details. It must NOT discuss or offer any loan scheme.
+                item name or confirmation of the sale details. A greeting that mentions the
+                shopkeeper's saved udhaar balance is acceptable, but the assistant must NOT
+                offer, discuss, or check any government loan scheme.
                 """,
         )
 
@@ -237,4 +239,87 @@ async def test_no_outbound_call_without_consent() -> None:
                 agreed AND provided a phone number. It may ask for explicit consent and a
                 phone number first, or explain it cannot call without consent on record.
                 """,
+        )
+
+
+def test_escalation_duplicate_prevention() -> None:
+    """Similar open escalation is updated (same ref), dissimilar creates a new one."""
+    user = "esc-dup-test"
+    now = "2026-08-14T00:00:00"
+    base = {
+        "who": "Ramesh",
+        "what_happened": "a bank officer asked for my OTP",
+        "already_checked": "warned him",
+        "urgency": "high",
+        "language": "unknown",
+        "preferred_followup": "call back",
+        "status": "open",
+        "created_at": now,
+    }
+    khata_memory.save_escalation({**base, "reference_id": "KV-1111", "user_id": user})
+    dup = khata_memory.find_similar_open_escalation(
+        user, "someone from the bank asked me for my OTP number"
+    )
+    assert dup and dup["reference_id"] == "KV-1111"
+    assert (
+        khata_memory.find_similar_open_escalation(user, "my shop roof is leaking")
+        is None
+    )
+    khata_memory.save_escalation(
+        {**base, "reference_id": "KV-1111", "urgency": "emergency", "user_id": user}
+    )
+    assert (
+        khata_memory.find_similar_open_escalation(
+            user, "bank officer asked for my OTP again"
+        )["urgency"]
+        == "emergency"
+    )
+
+
+def test_strip_pii() -> None:
+    """OTP/account/card/Aadhaar/PAN numbers must never reach the summary."""
+    assert _strip_pii("my OTP is 482913") == "my OTP is [redacted]"
+    assert _strip_pii("card 1234 5678 9012 3456") == "card [redacted]"
+    assert _strip_pii("Aadhaar 1234-5678-9012") == "Aadhaar [redacted]"
+    assert _strip_pii("PAN ABCDE1234F") == "PAN [redacted]"
+    assert _strip_pii("no numbers here") == "no numbers here"
+
+
+@pytest.mark.asyncio
+async def test_escalation_fires_on_fraud() -> None:
+    """Fraud report then explicit permission must fire create_escalation."""
+    async with (
+        _llm() as llm,
+        AgentSession(llm=llm) as session,
+    ):
+        await session.start(Assistant())
+
+        await session.run(
+            user_input="A man said he is from the bank and asked for my OTP."
+        )
+
+        result = await session.run(
+            user_input="Yes, please report it to your team. They can call me back."
+        )
+
+        result.expect.contains_function_call(name="create_escalation")
+
+
+@pytest.mark.asyncio
+async def test_no_escalation_when_user_refuses() -> None:
+    """Without permission the agent must not call create_escalation."""
+    async with (
+        _llm() as llm,
+        AgentSession(llm=llm) as session,
+    ):
+        await session.start(Assistant())
+
+        result = await session.run(
+            user_input="Someone asked for my OTP saying they are from the bank. "
+            "But no, do not report anything to anyone."
+        )
+
+        assert not any(
+            e.type == "function_call" and e.item.name == "create_escalation"
+            for e in result.events
         )

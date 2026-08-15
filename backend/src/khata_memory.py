@@ -7,6 +7,7 @@ in `facts` as JSON so the schema stays trivially simple.
 
 import json
 import os
+import re
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -36,6 +37,18 @@ CREATE TABLE IF NOT EXISTS reminders (
     deadline TEXT NOT NULL,
     reason TEXT,
     status TEXT NOT NULL DEFAULT 'pending',
+    created_at TEXT
+);
+CREATE TABLE IF NOT EXISTS escalations (
+    reference_id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    who TEXT,
+    what_happened TEXT NOT NULL,
+    already_checked TEXT,
+    urgency TEXT NOT NULL,
+    language TEXT,
+    preferred_followup TEXT,
+    status TEXT NOT NULL DEFAULT 'open',
     created_at TEXT
 )
 """
@@ -288,6 +301,83 @@ def latest_reminder(user_id: str) -> dict | None:
     return dict(row) if row else None
 
 
+_STOPWORDS = {
+    "the",
+    "a",
+    "an",
+    "and",
+    "but",
+    "or",
+    "for",
+    "to",
+    "of",
+    "on",
+    "in",
+    "me",
+    "my",
+    "i",
+    "it",
+    "about",
+    "with",
+    "they",
+    "someone",
+    "said",
+}
+
+
+def _tokens(text: str) -> set[str]:
+    words = set(re.findall(r"[a-z0-9]+", text.lower()))
+    return words - _STOPWORDS
+
+
+def _similarity(a: str, b: str) -> float:
+    """Jaccard token overlap between two texts."""
+    ta, tb = _tokens(a), _tokens(b)
+    if not ta or not tb:
+        return 0.0
+    return len(ta & tb) / len(ta | tb)
+
+
+def find_similar_open_escalation(user_id: str, what_happened: str) -> dict | None:
+    """Return an open escalation with a similar what_happened, if any (dup check)."""
+    init_db()
+    with _db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM escalations WHERE user_id = ? AND status = 'open'",
+            (user_id,),
+        ).fetchall()
+    best, best_score = None, 0.0
+    for row in rows:
+        score = _similarity(what_happened, row["what_happened"])
+        if score > best_score:
+            best, best_score = dict(row), score
+    return best if best_score >= 0.5 else None
+
+
+def save_escalation(row: dict) -> None:
+    """Insert a new escalation or update an existing one (by reference_id)."""
+    init_db()
+    cols = [
+        "reference_id",
+        "user_id",
+        "who",
+        "what_happened",
+        "already_checked",
+        "urgency",
+        "language",
+        "preferred_followup",
+        "status",
+        "created_at",
+    ]
+    with _db() as conn:
+        conn.execute(
+            f"INSERT INTO escalations ({', '.join(cols)}) VALUES ({', '.join('?' * len(cols))}) "
+            "ON CONFLICT(reference_id) DO UPDATE SET "
+            + ", ".join(f"{c} = excluded.{c}" for c in cols if c != "reference_id"),
+            [row.get(c) for c in cols],
+        )
+
+
 if __name__ == "__main__":
     import tempfile
 
@@ -324,4 +414,37 @@ if __name__ == "__main__":
     # no consent -> refuses to schedule
     set_call_consent("u1", False)
     assert "No consent" in schedule_reminder("u1", "2026-08-31", "SVANidhi deadline")
+    # escalations + dup prevention
+    now = _now_iso()
+    save_escalation(
+        {
+            "reference_id": "KV-1234",
+            "user_id": "u1",
+            "who": "Ramesh",
+            "what_happened": "caller says a bank officer asked for his OTP",
+            "already_checked": "told him not to share it",
+            "urgency": "high",
+            "language": "unknown",
+            "preferred_followup": "call back",
+            "status": "open",
+            "created_at": now,
+        }
+    )
+    dup = find_similar_open_escalation("u1", "a bank officer asked for my OTP number")
+    assert dup and dup["reference_id"] == "KV-1234"
+    assert find_similar_open_escalation("u1", "the roof is leaking in the shop") is None
+    save_escalation(
+        {
+            "reference_id": "KV-1234",
+            "user_id": "u1",
+            "who": "Ramesh",
+            "what_happened": "updated: bank officer asked for OTP again",
+            "already_checked": "warned again",
+            "urgency": "emergency",
+            "language": "unknown",
+            "preferred_followup": "call back",
+            "status": "open",
+            "created_at": now,
+        }
+    )
     print(f"self-check OK -> {DB_PATH}")
