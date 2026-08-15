@@ -34,14 +34,14 @@ logger = logging.getLogger("agent")
 
 load_dotenv(".env.local")
 
-# Khata-Vaani — voice bookkeeping agent for Indian shopkeepers.
+# Khata-Vaani � voice bookkeeping agent for Indian shopkeepers.
 silent_nudge = "Still there? Go ahead whenever you're ready."
 silent_close = "It's been quiet, so I'll close up now. Take care, bye!"
 
 # Outbound call tuning
-VOICEMAIL_WAIT_S = 8.0  # no user speech this long after STT active → voicemail
+VOICEMAIL_WAIT_S = 8.0  # no user speech this long after STT active ? voicemail
 HANGUP_WINDOW_S = (
-    6.0  # hangup within this window of answering → immediate_hangup (opt-out)
+    6.0  # hangup within this window of answering ? immediate_hangup (opt-out)
 )
 RINGING_TIMEOUT_S = 30.0
 RETRY_DELAY_S = 10.0  # pause before the one retry after no-answer/busy
@@ -90,8 +90,8 @@ and you may reply in the same mixed register if that's what they used first.
 Keep sentences short - this is spoken, not read.
 
 LANGUAGE & SCRIPT
-Always write every language in its own native script. Hindi → Devanagari
-(नमस्ते), never romanized (never 'namaste'). Same rule for all non-English
+Always write every language in its own native script. Hindi ? Devanagari
+(??????), never romanized (never 'namaste'). Same rule for all non-English
 languages.
 
 GUARDRAILS
@@ -207,7 +207,7 @@ def _post_discord(summary: dict) -> bool:
         "content": f"New escalation {summary['reference_id']}",
         "embeds": [
             {
-                "title": f"{summary['urgency'].upper()} — {summary['who']}",
+                "title": f"{summary['urgency'].upper()} � {summary['who']}",
                 "description": summary["what_happened"],
                 "fields": [
                     {
@@ -728,8 +728,7 @@ async def my_agent(ctx: JobContext):
         # Text-to-speech (TTS) is your agent's voice, turning the LLM's text into speech that the user can hear
         # See all available models as well as voice selections at https://docs.livekit.io/agents/models/tts/
         tts=murf.TTS(
-            voice="Pooja",  # en-IN Indian English (Falcon 2) — Murf voice library
-            locale="en-IN",
+            voice="Pooja",  # en-IN Indian English (Falcon 2) � Murf voice library
             style="Conversation",
             tokenizer=tokenize.basic.SentenceTokenizer(min_sentence_len=2),
             text_pacing=True,
@@ -742,7 +741,7 @@ async def my_agent(ctx: JobContext):
         # See more at https://docs.livekit.io/agents/build/audio/#preemptive-generation
         preemptive_generation=True,
         # mark the user as "away" after this much silence (both agent and user
-        # quiet) so we can nudge them — no fixed sleep timers needed
+        # quiet) so we can nudge them � no fixed sleep timers needed
         user_away_timeout=6.0,
     )
 
@@ -763,7 +762,7 @@ async def my_agent(ctx: JobContext):
             logger.info(f"[LATENCY] end-of-speech to first audio out: {ms:.1f}ms")
             speech_end_ts["t"] = None
 
-    # Silence handling — driven by LiveKit's built-in "away" detection
+    # Silence handling � driven by LiveKit's built-in "away" detection
     # (user_away_timeout). First silent gap: gentle nudge. Still silent after
     # the nudge: close politely instead of repeating forever.
     away_state = {"nudges": 0, "watch": None}
@@ -784,7 +783,7 @@ async def my_agent(ctx: JobContext):
             if away_state["nudges"] == 1:
                 session.say(silent_nudge, add_to_chat_ctx=False)
         else:
-            # user spoke (or is speaking) — this is a fresh gap
+            # user spoke (or is speaking) � this is a fresh gap
             away_state["nudges"] = 0
             if away_state["watch"] is not None:
                 away_state["watch"].cancel()
