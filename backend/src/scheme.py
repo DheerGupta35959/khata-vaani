@@ -81,7 +81,9 @@ def check_eligibility(
 if __name__ == "__main__":
     r = json.loads(check_eligibility({}, previous_loans=None))
     assert r["likely_tier"].startswith("Tier 1")
-    r2 = json.loads(check_eligibility({"usual_items_sold": ["hair oil"]}, previous_loans=2))
+    r2 = json.loads(
+        check_eligibility({"usual_items_sold": ["hair oil"]}, previous_loans=2)
+    )
     assert r2["likely_tier"].startswith("Tier 3") and "50,000" in r2["likely_tier"]
     r3 = json.loads(check_eligibility({}, vending_certificate=False))
     assert "NOT fully met" in r3["eligibility_assessment"]

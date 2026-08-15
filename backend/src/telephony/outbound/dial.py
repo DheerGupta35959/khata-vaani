@@ -21,7 +21,6 @@ import argparse
 import asyncio
 import json
 import re
-import sys
 import uuid
 
 from dotenv import load_dotenv

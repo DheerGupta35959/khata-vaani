@@ -198,6 +198,29 @@ assessment if the dataset fails to load.
 To update the criteria, edit `src/scheme_data.json` and re-run
 `uv run python src/scheme.py` (self-check).
 
+### Scheme Sahayak handoff
+
+For **sustained** scheme discussion — comparing multiple schemes, deep document
+or follow-up questions, or "what else am I eligible for" — the main assistant
+calls `connect_scheme_specialist` and LiveKit hands the conversation to
+`SchemeSahayak`, a dedicated specialist agent (`src/agent.py`). This uses the
+same multi-agent handoff pattern as the
+[murf-livekit-starter `agent-handoff` branch](https://github.com/murf-ai/murf-livekit-starter/tree/agent-handoff):
+the tool returns `(Agent, str)`, the returned string is spoken by the current
+agent before switching, and the new agent sees the copied chat context.
+
+- Before switching, the main agent says "Main aapko hamare scheme specialist se
+  connect karta hoon." The specialist introduces itself on takeover.
+- The shopkeeper's saved profile and any prior `check_scheme_eligibility`
+  result are passed to the specialist so it doesn't re-ask.
+- The specialist inherits the scheme-eligibility and escalation guardrails but
+  has **no** sales/udhaar tools. If the shopkeeper drifts back to logging a sale
+  or udhaar (or says "chalo wapas"), it calls `hand_back_to_main`.
+- A single eligibility check does **not** trigger the handoff — it stays with
+  `check_scheme_eligibility` on the main agent.
+- If the specialist fails to initialize, the main agent says so honestly and
+  keeps helping with its own `check_scheme_eligibility` tool.
+
 ## Outbound calls (reminders)
 
 The agent can place outbound reminder calls before a scheme/loan application

@@ -34,7 +34,7 @@ logger = logging.getLogger("agent")
 
 load_dotenv(".env.local")
 
-# Khata-Vaani — voice bookkeeping agent for Indian shopkeepers.
+# Khata-Vaani â€” voice bookkeeping agent for Indian shopkeepers.
 silent_nudge = "Still there? Go ahead whenever you're ready."
 silent_close = "It's been quiet, so I'll close up now. Take care, bye!"
 
@@ -66,7 +66,11 @@ OBJECTIVES
 4. Answer "who owes me how much" queries from the saved ledger.
 5. If asked for a summary, you may mention outstanding udhaar, but only when
    asked - don't volunteer it unprompted.
-6. Escalate to the team (create_escalation) in exactly two situations:
+6. For sustained, in-depth scheme discussion - comparing multiple schemes,
+   deep document or follow-up questions, or "what else am I eligible for" -
+   call connect_scheme_specialist to hand the shopkeeper to the scheme
+   specialist. A single eligibility check stays with check_scheme_eligibility.
+7. Escalate to the team (create_escalation) in exactly two situations:
    - the shopkeeper reports something that sounds like fraud (fake currency,
      suspicious payment/OTP requests, someone impersonating a bank or scheme
      official)
@@ -74,7 +78,7 @@ OBJECTIVES
      whether to write off a debt or extend more credit to a customer)
    Before calling create_escalation, say out loud exactly what you're about to
    send and ask permission. If the shopkeeper says no, do not call the function.
-7. After a successful escalation, read back the reference_id and give an
+8. After a successful escalation, read back the reference_id and give an
    honest next step - say "a team member will follow up", never a specific
    time like "someone will call in five minutes".
 
@@ -145,6 +149,55 @@ GUARDRAILS
   and say "scheme" - Khata-Vaani can help in their next session."""
 
 
+SPECIALIST_PROMPT = """IDENTITY
+You are Scheme Sahayak, the government-scheme specialist at Khata-Vaani. You
+work for the shopkeeper, not for any bank, lender, or platform. You only speak
+after the main Khata-Vaani assistant has handed the conversation to you.
+
+JOB
+1. Help the shopkeeper understand government schemes in depth: how a scheme
+   works, who it is for, what documents are needed, and the typical steps to
+   apply. Go beyond a single eligibility check - compare multiple schemes and
+   answer detailed document and follow-up questions.
+2. The shopkeeper's profile and any prior eligibility result are in the
+   conversation context - do not re-ask for what is already known.
+3. For a concrete eligibility assessment, call check_scheme_eligibility. Do
+   not guess at eligibility yourself.
+
+HAND BACK
+If the shopkeeper asks about logging a sale or udhaar, asks who owes them how
+much, or says something like "chalo wapas", "back to khata", or "main khata
+karna chahta hoon", do not help with it here. Call hand_back_to_main to return
+the conversation to the main Khata-Vaani assistant, who handles sales and
+udhaar logging.
+
+GUARDRAILS
+- Never ask for OTP, PIN, UPI ID, or account/card numbers, under any framing.
+- You may check published eligibility criteria for a government scheme and
+  report a document checklist. You must never say a scheme, loan, or credit
+  line is "approved" - only that criteria are met or not met, and always add
+  that final approval happens through the scheme's official channel.
+- Whenever you give any scheme eligibility result, always say out loud that it
+  is based on published guidelines as of the dataset's date, that it is not a
+  live government check, and that final approval happens only through the
+  official channel.
+- Never store account numbers, card numbers, or any government ID numbers
+  (Aadhaar, PAN, etc.), even if the shopkeeper offers them.
+- Escalate suspected fraud exactly like the main agent: say out loud what you
+  are about to send, ask permission, then call create_escalation. If the
+  shopkeeper says no, do not call it.
+- If asked about a scheme outside your dataset, say so honestly and explain at
+  a general level from published guidelines. Never claim approval.
+
+LANGUAGE & SCRIPT
+Mirror the user. Keep sentences short - this is spoken, not read. Always write
+every language in its own native script (Hindi â†’ Devanagari).
+
+STYLE
+Short sentences, under ~20 words. No lists, no brackets, nothing written for a
+screen - this gets spoken aloud."""
+
+
 def outbound_opening_line(deadline: str) -> str:
     """Two-sentence opening line: who we are, why we called, and how to opt out."""
     return (
@@ -207,7 +260,7 @@ def _post_discord(summary: dict) -> bool:
         "content": f"New escalation {summary['reference_id']}",
         "embeds": [
             {
-                "title": f"{summary['urgency'].upper()} — {summary['who']}",
+                "title": f"{summary['urgency'].upper()} â€” {summary['who']}",
                 "description": summary["what_happened"],
                 "fields": [
                     {
@@ -295,15 +348,19 @@ def _is_decline(text: str) -> bool:
     return first in ("no", "nahi", "nhi")
 
 
-class Assistant(Agent):
-    def __init__(
-        self, instructions: str = SYSTEM_PROMPT, opening_line: str | None = None
-    ) -> None:
-        chat_ctx = None
-        if opening_line:
-            chat_ctx = ChatContext()
-            chat_ctx.add_message(role="assistant", content=opening_line)
-        super().__init__(instructions=instructions, chat_ctx=chat_ctx)
+def _prior_eligibility(ctx: ChatContext) -> str | None:
+    """Last check_scheme_eligibility result in the conversation, if any."""
+    for item in reversed(ctx.items):
+        if (
+            getattr(item, "type", None) == "function_call_output"
+            and getattr(item, "name", None) == "check_scheme_eligibility"
+        ):
+            return item.output
+    return None
+
+
+class KhataAgent(Agent):
+    """Tools shared by the main assistant and the Scheme Sahayak specialist."""
 
     @staticmethod
     def _user_id(context: RunContext) -> str:
@@ -312,66 +369,6 @@ class Assistant(Agent):
             return (context.userdata or {}).get("user_id", "unknown")
         except Exception:
             return "unknown"
-
-    @function_tool
-    async def lookup_caller(
-        self,
-        context: RunContext,
-        user_id: str = "",
-        name: str | None = None,
-        shop_name: str | None = None,
-    ):
-        """Look up the shopkeeper's saved profile and customer ledger.
-
-        Call this once at the start of a session to check whether the shopkeeper
-        is returning. Returns their name, shop name, language preference, usual
-        items sold, and each customer's udhaar balance (highest first).
-
-        Args:
-            user_id: The shopkeeper's caller id. Leave empty to use the session
-                caller automatically.
-            name: The shopkeeper's name, if they just told you it. It will be
-                remembered for next time.
-            shop_name: The shop name, if they just told you it. It will be
-                remembered for next time.
-        """
-        resolved_id = user_id or self._user_id(context)
-        if name or shop_name:
-            khata_memory.remember_profile(resolved_id, name=name, shop_name=shop_name)
-        logger.info("lookup_caller user=%s", resolved_id)
-        return khata_memory.lookup_caller(resolved_id)
-
-    @function_tool
-    async def save_customer_entry(
-        self, context: RunContext, name: str, amount: float, entry_type: str
-    ):
-        """Save a sale or update a customer's udhaar balance.
-
-        Only call this AFTER the shopkeeper has explicitly confirmed the details
-        out loud. Use entry_type "udhaar" to add `amount` to a customer's credit
-        balance, or "sale" to log an item sold.
-
-        Args:
-            name: Customer name for udhaar, or item name for a sale.
-            amount: Amount in rupees.
-            entry_type: "udhaar" or "sale".
-        """
-        user_id = self._user_id(context)
-        logger.info(
-            "save_customer_entry user=%s type=%s name=%s amount=%s",
-            user_id,
-            entry_type,
-            name,
-            amount,
-        )
-        result = khata_memory.save_customer_entry(user_id, name, amount, entry_type)
-        recorder = getattr(self, "_recorder", None)
-        if recorder:
-            if "saved" in result or "logged" in result:
-                recorder.mark_saved()
-            elif result.startswith("Unknown entry_type"):
-                recorder.mark_tool_error()
-        return result
 
     @function_tool
     async def check_scheme_eligibility(
@@ -402,44 +399,6 @@ class Assistant(Agent):
             if recorder:
                 recorder.mark_tool_error()
             raise
-
-    @function_tool
-    async def set_call_consent(
-        self, context: RunContext, consent: bool, phone: str | None = None
-    ):
-        """Record whether the shopkeeper explicitly agreed to receive outbound reminder calls.
-
-        Only call when they explicitly agree to being called about a scheme or loan
-        deadline. Their phone number is required to say yes. If they say stop, don't
-        call again, or hang up immediately, call this with consent=false to revoke.
-
-        Args:
-            consent: True if they explicitly agreed to receive calls, False to revoke.
-            phone: Their phone number in E.164 format (e.g. +919876543210), required to consent.
-        """
-        user_id = self._user_id(context)
-        logger.info("set_call_consent user=%s consent=%s", user_id, consent)
-        if consent and not phone:
-            return "I need their phone number before I can set up call reminders."
-        return khata_memory.set_call_consent(user_id, consent, phone=phone)
-
-    @function_tool
-    async def schedule_reminder_call(
-        self, context: RunContext, deadline: str, reason: str
-    ):
-        """Queue an outbound reminder call before a scheme or loan application deadline.
-
-        Call only after the shopkeeper explicitly agreed to be called and set_call_consent
-        succeeded. If no consent is on record this refuses - surface the reminder in-session
-        instead of scheduling a call.
-
-        Args:
-            deadline: Application deadline as an ISO date (YYYY-MM-DD).
-            reason: Why they should be reminded, e.g. "PM SVANidhi application deadline".
-        """
-        user_id = self._user_id(context)
-        logger.info("schedule_reminder_call user=%s deadline=%s", user_id, deadline)
-        return khata_memory.schedule_reminder(user_id, deadline, reason)
 
     @function_tool
     async def create_escalation(
@@ -517,6 +476,193 @@ class Assistant(Agent):
             f"Escalation {summary['reference_id']} recorded, but the team alert could "
             "not be delivered right now. It is on file - a team member will follow up."
         )
+
+
+class SchemeSahayak(KhataAgent):
+    """Government-scheme specialist. Handles sustained scheme discussion only;
+    hands sales/udhaar topics back to the main assistant."""
+
+    def __init__(
+        self,
+        chat_ctx: ChatContext | None = None,
+        profile: dict | None = None,
+        prior_eligibility: str | None = None,
+    ) -> None:
+        instructions = SPECIALIST_PROMPT
+        if profile:
+            instructions += (
+                "\n\nKNOWN SHOPKEEPER CONTEXT (passed by Khata-Vaani):\n"
+                + json.dumps(profile, ensure_ascii=False, default=str)
+            )
+        if prior_eligibility:
+            instructions += (
+                "\n\nPRIOR ELIGIBILITY RESULT (from Khata-Vaani):\n" + prior_eligibility
+            )
+        super().__init__(instructions=instructions, chat_ctx=chat_ctx)
+
+    async def on_enter(self) -> None:
+        await self.session.generate_reply(
+            instructions=(
+                "Introduce yourself as Scheme Sahayak and offer to help with "
+                "government schemes. Say: 'Namaste, main Scheme Sahayak hoon - "
+                "sarkari yojnaon ke baare mein madad karunga.'"
+            )
+        )
+
+    @function_tool
+    async def hand_back_to_main(self, context: RunContext) -> tuple[Agent, str]:
+        """Return the conversation to the main Khata-Vaani assistant.
+
+        Use when the shopkeeper wants to log a sale or udhaar, asks who owes
+        them how much, or says something like "chalo wapas" / "back to khata".
+        """
+        main = Assistant(
+            instructions=SYSTEM_PROMPT,
+            chat_ctx=self.chat_ctx.copy(exclude_instructions=True),
+        )
+        main._recorder = getattr(self, "_recorder", None)
+        return main, "Main aapko wapas Khata-Vaani se connect karta hoon."
+
+
+class Assistant(KhataAgent):
+    def __init__(
+        self,
+        instructions: str = SYSTEM_PROMPT,
+        opening_line: str | None = None,
+        chat_ctx: ChatContext | None = None,
+    ) -> None:
+        if chat_ctx is None and opening_line:
+            chat_ctx = ChatContext()
+            chat_ctx.add_message(role="assistant", content=opening_line)
+        super().__init__(instructions=instructions, chat_ctx=chat_ctx)
+
+    @function_tool
+    async def lookup_caller(
+        self,
+        context: RunContext,
+        user_id: str = "",
+        name: str | None = None,
+        shop_name: str | None = None,
+    ):
+        """Look up the shopkeeper's saved profile and customer ledger.
+
+        Call this once at the start of a session to check whether the shopkeeper
+        is returning. Returns their name, shop name, language preference, usual
+        items sold, and each customer's udhaar balance (highest first).
+
+        Args:
+            user_id: The shopkeeper's caller id. Leave empty to use the session
+                caller automatically.
+            name: The shopkeeper's name, if they just told you it. It will be
+                remembered for next time.
+            shop_name: The shop name, if they just told you it. It will be
+                remembered for next time.
+        """
+        resolved_id = user_id or self._user_id(context)
+        if name or shop_name:
+            khata_memory.remember_profile(resolved_id, name=name, shop_name=shop_name)
+        logger.info("lookup_caller user=%s", resolved_id)
+        return khata_memory.lookup_caller(resolved_id)
+
+    @function_tool
+    async def save_customer_entry(
+        self, context: RunContext, name: str, amount: float, entry_type: str
+    ):
+        """Save a sale or update a customer's udhaar balance.
+
+        Only call this AFTER the shopkeeper has explicitly confirmed the details
+        out loud. Use entry_type "udhaar" to add `amount` to a customer's credit
+        balance, or "sale" to log an item sold.
+
+        Args:
+            name: Customer name for udhaar, or item name for a sale.
+            amount: Amount in rupees.
+            entry_type: "udhaar" or "sale".
+        """
+        user_id = self._user_id(context)
+        logger.info(
+            "save_customer_entry user=%s type=%s name=%s amount=%s",
+            user_id,
+            entry_type,
+            name,
+            amount,
+        )
+        result = khata_memory.save_customer_entry(user_id, name, amount, entry_type)
+        recorder = getattr(self, "_recorder", None)
+        if recorder:
+            if "saved" in result or "logged" in result:
+                recorder.mark_saved()
+            elif result.startswith("Unknown entry_type"):
+                recorder.mark_tool_error()
+        return result
+
+    @function_tool
+    async def connect_scheme_specialist(
+        self, context: RunContext
+    ) -> tuple[Agent, str] | str:
+        """Hand the shopkeeper to Scheme Sahayak, the government-scheme specialist.
+
+        Use ONLY when the conversation needs sustained, in-depth scheme
+        discussion: comparing multiple schemes, deep document or eligibility
+        questions, or "what else am I eligible for". Do NOT use for a single
+        eligibility check - that stays with check_scheme_eligibility.
+        """
+        user_id = self._user_id(context)
+        logger.info("handoff to scheme specialist user=%s", user_id)
+        try:
+            specialist = SchemeSahayak(
+                chat_ctx=self.chat_ctx.copy(exclude_instructions=True),
+                profile=khata_memory.get_profile(user_id),
+                prior_eligibility=_prior_eligibility(self.chat_ctx),
+            )
+        except Exception:
+            logger.exception(
+                "Scheme Sahayak failed to initialize - continuing as main agent"
+            )
+            return (
+                "The scheme specialist is unavailable right now. I'll help you "
+                "with the scheme criteria myself - what would you like to know?"
+            )
+        specialist._recorder = getattr(self, "_recorder", None)
+        return specialist, "Main aapko hamare scheme specialist se connect karta hoon."
+
+    @function_tool
+    async def set_call_consent(
+        self, context: RunContext, consent: bool, phone: str | None = None
+    ):
+        """Record whether the shopkeeper explicitly agreed to receive outbound reminder calls.
+
+        Only call when they explicitly agree to being called about a scheme or loan
+        deadline. Their phone number is required to say yes. If they say stop, don't
+        call again, or hang up immediately, call this with consent=false to revoke.
+
+        Args:
+            consent: True if they explicitly agreed to receive calls, False to revoke.
+            phone: Their phone number in E.164 format (e.g. +919876543210), required to consent.
+        """
+        user_id = self._user_id(context)
+        logger.info("set_call_consent user=%s consent=%s", user_id, consent)
+        if consent and not phone:
+            return "I need their phone number before I can set up call reminders."
+        return khata_memory.set_call_consent(user_id, consent, phone=phone)
+
+    @function_tool
+    async def schedule_reminder_call(
+        self, context: RunContext, deadline: str, reason: str
+    ):
+        """Queue an outbound reminder call before a scheme or loan application deadline.
+
+        Call only after the shopkeeper explicitly agreed to be called and set_call_consent
+        succeeded. If no consent is on record this refuses - surface the reminder in-session
+        instead of scheduling a call.
+
+        Args:
+            deadline: Application deadline as an ISO date (YYYY-MM-DD).
+            reason: Why they should be reminded, e.g. "PM SVANidhi application deadline".
+        """
+        user_id = self._user_id(context)
+        logger.info("schedule_reminder_call user=%s deadline=%s", user_id, deadline)
+        return khata_memory.schedule_reminder(user_id, deadline, reason)
 
 
 server = AgentServer()
@@ -728,7 +874,7 @@ async def my_agent(ctx: JobContext):
         # Text-to-speech (TTS) is your agent's voice, turning the LLM's text into speech that the user can hear
         # See all available models as well as voice selections at https://docs.livekit.io/agents/models/tts/
         tts=murf.TTS(
-            voice="Pooja",  # en-IN Indian English (Falcon 2) — Murf voice library
+            voice="Pooja",  # en-IN Indian English (Falcon 2) â€” Murf voice library
             style="Conversation",
             tokenizer=tokenize.basic.SentenceTokenizer(min_sentence_len=2),
             text_pacing=True,
@@ -741,7 +887,7 @@ async def my_agent(ctx: JobContext):
         # See more at https://docs.livekit.io/agents/build/audio/#preemptive-generation
         preemptive_generation=True,
         # mark the user as "away" after this much silence (both agent and user
-        # quiet) so we can nudge them — no fixed sleep timers needed
+        # quiet) so we can nudge them â€” no fixed sleep timers needed
         user_away_timeout=6.0,
     )
 
@@ -762,7 +908,7 @@ async def my_agent(ctx: JobContext):
             logger.info(f"[LATENCY] end-of-speech to first audio out: {ms:.1f}ms")
             speech_end_ts["t"] = None
 
-    # Silence handling — driven by LiveKit's built-in "away" detection
+    # Silence handling â€” driven by LiveKit's built-in "away" detection
     # (user_away_timeout). First silent gap: gentle nudge. Still silent after
     # the nudge: close politely instead of repeating forever.
     away_state = {"nudges": 0, "watch": None}
@@ -783,7 +929,7 @@ async def my_agent(ctx: JobContext):
             if away_state["nudges"] == 1:
                 session.say(silent_nudge, add_to_chat_ctx=False)
         else:
-            # user spoke (or is speaking) — this is a fresh gap
+            # user spoke (or is speaking) â€” this is a fresh gap
             away_state["nudges"] = 0
             if away_state["watch"] is not None:
                 away_state["watch"].cancel()

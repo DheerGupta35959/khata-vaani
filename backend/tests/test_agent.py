@@ -12,6 +12,7 @@ os.environ.setdefault(
 import khata_memory
 from agent import (
     Assistant,
+    SchemeSahayak,
     _is_decline,
     _is_who_owes_query,
     _strip_pii,
@@ -365,3 +366,147 @@ async def test_no_escalation_when_user_refuses() -> None:
             e.type == "function_call" and e.item.name == "create_escalation"
             for e in result.events
         )
+
+
+@pytest.mark.asyncio
+async def test_handoff_passes_context_to_specialist() -> None:
+    """Forward handoff seeds the specialist with profile + prior eligibility."""
+    from types import SimpleNamespace
+
+    from livekit.agents.llm.chat_context import FunctionCallOutput
+
+    assistant = Assistant()
+    prior_ctx = assistant.chat_ctx.copy()
+    prior_ctx._items.append(
+        FunctionCallOutput(
+            id="item-1",
+            call_id="call-1",
+            name="check_scheme_eligibility",
+            output="eligible tier 2",
+            is_error=False,
+        )
+    )
+    assistant._chat_ctx = prior_ctx
+
+    specialist, line = await assistant.connect_scheme_specialist(
+        SimpleNamespace(userdata={"user_id": "unknown"})
+    )
+
+    assert isinstance(specialist, SchemeSahayak)
+    assert line == "Main aapko hamare scheme specialist se connect karta hoon."
+    assert "Ramesh" in specialist.instructions  # shopkeeper profile passed
+    assert "eligible tier 2" in specialist.instructions  # prior result passed
+
+
+@pytest.mark.asyncio
+async def test_handoff_failure_fallback() -> None:
+    """If the specialist can't be built, the main agent says so and keeps helping."""
+    from types import SimpleNamespace
+
+    original = SchemeSahayak.__init__
+
+    def _boom(self, *args, **kwargs):
+        raise RuntimeError("init failed")
+
+    SchemeSahayak.__init__ = _boom
+    try:
+        out = await Assistant().connect_scheme_specialist(
+            SimpleNamespace(userdata={"user_id": "unknown"})
+        )
+    finally:
+        SchemeSahayak.__init__ = original
+
+    assert isinstance(out, str)
+    assert "unavailable" in out
+    assert "specialist" in out
+
+
+@pytest.mark.asyncio
+async def test_specialist_hands_back_to_main() -> None:
+    """Hand-back returns the main assistant with a spoken line."""
+    from types import SimpleNamespace
+
+    main, line = await SchemeSahayak().hand_back_to_main(
+        SimpleNamespace(userdata={"user_id": "unknown"})
+    )
+
+    assert isinstance(main, Assistant)
+    assert line == "Main aapko wapas Khata-Vaani se connect karta hoon."
+
+
+@pytest.mark.asyncio
+async def test_hands_sustained_scheme_discussion_to_specialist() -> None:
+    """Deep multi-scheme discussion must hand off to Scheme Sahayak."""
+    async with (
+        _llm() as llm,
+        AgentSession(llm=llm) as session,
+    ):
+        await session.start(Assistant())
+
+        result = await session.run(
+            user_input="I want to know about all the government schemes I might be "
+            "eligible for - compare them, what documents I need for each, and the "
+            "step-by-step application process."
+        )
+
+        result.expect.next_event().is_function_call(name="connect_scheme_specialist")
+        result.expect.next_event().is_function_call_output(
+            output="Main aapko hamare scheme specialist se connect karta hoon."
+        )
+        await (
+            result.expect.next_event()
+            .is_message(role="assistant")
+            .judge(
+                llm,
+                intent="Tells the user they are being connected to the scheme specialist.",
+            )
+        )
+        result.expect.next_event().is_agent_handoff(new_agent_type=SchemeSahayak)
+        await (
+            result.expect.next_event()
+            .is_message(role="assistant")
+            .judge(
+                llm,
+                intent=(
+                    "Introduces itself as Scheme Sahayak and offers to help with "
+                    "government schemes."
+                ),
+            )
+        )
+        result.expect.no_more_events()
+
+
+@pytest.mark.asyncio
+async def test_no_handoff_for_single_eligibility_check() -> None:
+    """A single eligibility check stays with the main agent's own tool."""
+    async with (
+        _llm() as llm,
+        AgentSession(llm=llm) as session,
+    ):
+        await session.start(Assistant())
+
+        result = await session.run(
+            user_input="Am I eligible for a PM SVANidhi loan? What documents do I need?"
+        )
+
+        result.expect.contains_function_call(name="check_scheme_eligibility")
+        assert not any(
+            e.type == "function_call" and e.item.name == "connect_scheme_specialist"
+            for e in result.events
+        )
+
+
+@pytest.mark.asyncio
+async def test_specialist_hands_sales_back() -> None:
+    """While with the specialist, a sale request hands back to the main agent."""
+    async with (
+        _llm() as llm,
+        AgentSession(llm=llm) as session,
+    ):
+        await session.start(SchemeSahayak())
+
+        result = await session.run(
+            user_input="Chalo wapas, I want to log a sale of 200 rupees."
+        )
+
+        result.expect.contains_function_call(name="hand_back_to_main")
