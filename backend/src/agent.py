@@ -6,6 +6,7 @@ import random
 import re
 import time
 import urllib.request
+import uuid
 
 from dotenv import load_dotenv
 from livekit import rtc
@@ -241,6 +242,59 @@ def _post_discord(summary: dict) -> bool:
         return False
 
 
+class _CallRecorder:
+    """Per-call facts gathered from real events, used to derive the outcome."""
+
+    def __init__(self) -> None:
+        self.success = False
+        self.tool_error = False
+        self.user_spoke = False
+        self.declined = False
+        self.escalation_created = False
+        self.finalized = False
+
+    def mark_saved(self) -> None:
+        self.success = True
+
+    def mark_looked_up(self) -> None:
+        self.success = True
+
+    def mark_tool_error(self) -> None:
+        self.tool_error = True
+
+    def mark_declined(self) -> None:
+        self.declined = True
+
+    def mark_escalation(self) -> None:
+        self.escalation_created = True
+
+
+def _is_who_owes_query(text: str) -> bool:
+    text = text.lower()
+    return any(
+        w in text
+        for w in (
+            "who owes",
+            "kitna bakaya",
+            "kitna udhaar",
+            "kitna baaki",
+            "bakaya kitna",
+            "kiska kitna",
+            "how much do they owe",
+            "outstanding balance",
+            "bakaya",
+        )
+    )
+
+
+def _is_decline(text: str) -> bool:
+    text = text.lower().strip()
+    if any(w in text for w in ("mat karo", "nahi chahiye", "no need", "abhi nahi")):
+        return True
+    first = re.sub(r"[^a-z]+$", "", text.split()[0]) if text else ""
+    return first in ("no", "nahi", "nhi")
+
+
 class Assistant(Agent):
     def __init__(
         self, instructions: str = SYSTEM_PROMPT, opening_line: str | None = None
@@ -310,7 +364,14 @@ class Assistant(Agent):
             name,
             amount,
         )
-        return khata_memory.save_customer_entry(user_id, name, amount, entry_type)
+        result = khata_memory.save_customer_entry(user_id, name, amount, entry_type)
+        recorder = getattr(self, "_recorder", None)
+        if recorder:
+            if "saved" in result or "logged" in result:
+                recorder.mark_saved()
+            elif result.startswith("Unknown entry_type"):
+                recorder.mark_tool_error()
+        return result
 
     @function_tool
     async def check_scheme_eligibility(
@@ -330,11 +391,17 @@ class Assistant(Agent):
         user_id = self._user_id(context)
         logger.info("check_scheme_eligibility user=%s", user_id)
         profile = khata_memory.get_profile(user_id)
-        return scheme.check_eligibility(
-            profile,
-            vending_certificate=vending_certificate,
-            previous_loans=previous_loans,
-        )
+        try:
+            return scheme.check_eligibility(
+                profile,
+                vending_certificate=vending_certificate,
+                previous_loans=previous_loans,
+            )
+        except Exception:
+            recorder = getattr(self, "_recorder", None)
+            if recorder:
+                recorder.mark_tool_error()
+            raise
 
     @function_tool
     async def set_call_consent(
@@ -430,6 +497,9 @@ class Assistant(Agent):
             )
 
         khata_memory.save_escalation({**summary, "user_id": user_id})
+        recorder = getattr(self, "_recorder", None)
+        if recorder:
+            recorder.mark_escalation()
         posted = _post_discord(summary)
         logger.info(
             "Escalation %s created user=%s urgency=%s discord=%s",
@@ -640,6 +710,8 @@ async def my_agent(ctx: JobContext):
         else None
     )
     instructions = OUTBOUND_PROMPT if outbound_phone else SYSTEM_PROMPT
+    recorder = _CallRecorder()
+    call_id = f"call-{uuid.uuid4().hex[:8]}"
 
     # Set up a voice AI pipeline using Murf Falcon, Gemini, Deepgram, and the LiveKit turn detector
     session = AgentSession(
@@ -746,8 +818,10 @@ async def my_agent(ctx: JobContext):
     # await avatar.start(session, room=ctx.room)
 
     # Start the session, which initializes the voice pipeline and warms up the models
+    assistant = Assistant(instructions=instructions, opening_line=opening_line)
+    assistant._recorder = recorder
     await session.start(
-        agent=Assistant(instructions=instructions, opening_line=opening_line),
+        agent=assistant,
         room=ctx.room,
         room_options=room_io.RoomOptions(
             audio_input=room_io.AudioInputOptions(
@@ -774,6 +848,52 @@ async def my_agent(ctx: JobContext):
             else "unknown"
         )
         session.userdata = {"user_id": remote}
+
+    # Call analytics: open a row, observe real events, close it on disconnect.
+    is_sip = outbound_phone or any(
+        p.kind == rtc.ParticipantKind.PARTICIPANT_KIND_SIP
+        for p in ctx.room.remote_participants.values()
+    )
+    user_id = session.userdata["user_id"]
+    language = khata_memory.get_profile(user_id).get("language_preference") or "unknown"
+    khata_memory.start_call(call_id, "sip" if is_sip else "browser", language)
+
+    @session.on("user_input_transcribed")
+    def _on_user_input_call(ev):
+        if ev.is_final and ev.transcript:
+            recorder.user_spoke = True
+            if _is_who_owes_query(ev.transcript):
+                recorder.mark_looked_up()
+            if _is_decline(ev.transcript):
+                recorder.mark_declined()
+
+    def _finalize_call(*_args):
+        if recorder.finalized:
+            return
+        recorder.finalized = True
+        failure_type = None
+        if recorder.success:
+            khata_memory.end_call(call_id, "success", None)
+        else:
+            if recorder.tool_error:
+                failure_type = "tool_error"
+            elif not recorder.user_spoke:
+                failure_type = "no_response"
+            elif recorder.declined:
+                failure_type = "user_declined"
+            else:
+                failure_type = "incomplete_hangup"
+            khata_memory.end_call(call_id, "failed", failure_type)
+        if recorder.escalation_created:
+            khata_memory.set_call_escalation(call_id)
+        logger.info(
+            "CALL %s ended: outcome=%s failure_type=%s",
+            call_id,
+            "success" if recorder.success else "failed",
+            failure_type,
+        )
+
+    ctx.room.on("disconnected", _finalize_call)
 
     # Outbound: dial, greet, then observe outcomes (voicemail / opt-out / hangup).
     if outbound_phone:

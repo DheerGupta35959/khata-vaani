@@ -50,6 +50,16 @@ CREATE TABLE IF NOT EXISTS escalations (
     preferred_followup TEXT,
     status TEXT NOT NULL DEFAULT 'open',
     created_at TEXT
+);
+CREATE TABLE IF NOT EXISTS calls (
+    call_id TEXT PRIMARY KEY,
+    started_at TEXT,
+    ended_at TEXT,
+    channel TEXT,
+    language TEXT,
+    outcome TEXT,
+    failure_type TEXT,
+    escalation_created INTEGER NOT NULL DEFAULT 0
 )
 """
 
@@ -378,6 +388,74 @@ def save_escalation(row: dict) -> None:
         )
 
 
+def start_call(call_id: str, channel: str, language: str) -> None:
+    """Insert a call row with outcome unset; end_call fills it in."""
+    init_db()
+    with _db() as conn:
+        conn.execute(
+            "INSERT INTO calls (call_id, started_at, channel, language) VALUES (?, ?, ?, ?)",
+            (call_id, _now_iso(), channel, language),
+        )
+
+
+def end_call(call_id: str, outcome: str, failure_type: str | None) -> None:
+    """Close a call row with the derived outcome and failure type."""
+    init_db()
+    with _db() as conn:
+        conn.execute(
+            "UPDATE calls SET ended_at = ?, outcome = ?, failure_type = ? WHERE call_id = ?",
+            (_now_iso(), outcome, failure_type, call_id),
+        )
+
+
+def set_call_escalation(call_id: str) -> None:
+    """Mark that this call produced an escalation."""
+    init_db()
+    with _db() as conn:
+        conn.execute(
+            "UPDATE calls SET escalation_created = 1 WHERE call_id = ?", (call_id,)
+        )
+
+
+def call_stats() -> dict:
+    """Aggregate dashboard numbers straight from the calls table."""
+    init_db()
+    with _db() as conn:
+        total = conn.execute("SELECT COUNT(*) FROM calls").fetchone()[0]
+        successful = conn.execute(
+            "SELECT COUNT(*) FROM calls WHERE outcome = 'success'"
+        ).fetchone()[0]
+        failed = conn.execute(
+            "SELECT COUNT(*) FROM calls WHERE outcome = 'failed'"
+        ).fetchone()[0]
+        breakdown = {
+            row["failure_type"] or "null": row["n"]
+            for row in conn.execute(
+                "SELECT failure_type, COUNT(*) AS n FROM calls "
+                "WHERE outcome = 'failed' GROUP BY failure_type"
+            )
+        }
+    return {
+        "total": total,
+        "successful": successful,
+        "failed": failed,
+        "success_rate": round(successful / total * 100, 1) if total else 0,
+        "failure_breakdown": breakdown,
+    }
+
+
+def recent_calls(limit: int = 20) -> list[dict]:
+    """Most recent calls, newest first. No names, no amounts."""
+    init_db()
+    with _db() as conn:
+        rows = conn.execute(
+            "SELECT call_id, started_at, ended_at, channel, language, outcome, failure_type "
+            "FROM calls ORDER BY started_at DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
 if __name__ == "__main__":
     import tempfile
 
@@ -447,4 +525,20 @@ if __name__ == "__main__":
             "created_at": now,
         }
     )
+    # call analytics
+    start_call("call-0001", "browser", "unknown")
+    end_call("call-0001", "success", None)
+    start_call("call-0002", "sip", "hindi")
+    end_call("call-0002", "failed", "no_response")
+    stats = call_stats()
+    assert stats["total"] == 2
+    assert stats["successful"] == 1
+    assert stats["failed"] == 1
+    assert stats["success_rate"] == 50.0
+    assert stats["failure_breakdown"]["no_response"] == 1
+    recent = recent_calls(limit=5)
+    by_id = {r["call_id"]: r for r in recent}
+    assert by_id["call-0002"]["outcome"] == "failed"
+    assert by_id["call-0001"]["outcome"] == "success"
+    set_call_escalation("call-0002")
     print(f"self-check OK -> {DB_PATH}")

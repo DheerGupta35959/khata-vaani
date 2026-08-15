@@ -43,6 +43,19 @@ pnpm dev
 
 Open [http://localhost:3000](http://localhost:3000). Make sure your backend agent is running too.
 
+## Call analytics dashboard
+
+Open [http://localhost:3000/dashboard](http://localhost:3000/dashboard). It shows
+live Total / Successful / Failed call counts, success rate, a failure-type
+breakdown chart (Chart.js), and a recent-calls list (anonymized as `Call
+#<id>`, with only timestamp, channel, language, and outcome — no names or
+amounts). Every number is queried from the backend SQLite `calls` table at
+request time via [`app/api/calls/route.ts`](app/api/calls/route.ts); refresh
+after a call to see updated numbers.
+
+The route reads `backend/khata.db` (override with `KHATA_DB_PATH`). If no calls
+have been recorded yet it shows zeros.
+
 ## Customization
 
 ### Branding & UI (`app-config.ts`)

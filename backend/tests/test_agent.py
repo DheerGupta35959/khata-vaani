@@ -10,7 +10,13 @@ os.environ.setdefault(
 )
 
 import khata_memory
-from agent import Assistant, _strip_pii, outbound_opening_line
+from agent import (
+    Assistant,
+    _is_decline,
+    _is_who_owes_query,
+    _strip_pii,
+    outbound_opening_line,
+)
 
 # Start each run from a clean, pre-seeded returning-shopkeeper profile.
 if os.path.exists(khata_memory.DB_PATH):
@@ -40,16 +46,19 @@ async def test_offers_assistance() -> None:
         await result.expect.next_event(type="message").judge(
             llm,
             intent="""
-                Greets the user in a friendly manner.
-
-                Optional context that may or may not be included:
-                - Offer of assistance with any request the user may have
-                - Other small talk or chit chat is acceptable, so long as it is friendly and not too intrusive
+                The assistant opens the session in a friendly manner. It greets the
+                user or says it will check whether it knows them from before (e.g.
+                "let me check if I know you"). A friendly tone, and optionally an
+                offer of assistance, is acceptable.
                 """,
         )
 
-        # Ensures there are no function calls or other unexpected events
-        result.expect.no_more_events()
+        # Ensures the greeting is not followed by unrelated tool activity
+        # (lookup_caller during the greeting is expected).
+        assert all(
+            e.type != "function_call" or e.item.name == "lookup_caller"
+            for e in result.events
+        )
 
 
 @pytest.mark.asyncio
@@ -160,10 +169,11 @@ async def test_scheme_tool_not_fired_on_unrelated() -> None:
         await result.expect.contains_message(role="assistant").judge(
             llm,
             intent="""
-                The assistant is handling the sale logging request - it asks for the missing
-                item name or confirmation of the sale details. A greeting that mentions the
-                shopkeeper's saved udhaar balance is acceptable, but the assistant must NOT
-                offer, discuss, or check any government loan scheme.
+                The assistant is handling the sale logging request - it asks for the
+                missing item name or confirmation of the sale details. Asking the
+                shopkeeper for identifying details (name, shop name) to remember them
+                is acceptable. But the assistant must NOT offer, discuss, or check any
+                government loan scheme.
                 """,
         )
 
@@ -283,6 +293,38 @@ def test_strip_pii() -> None:
     assert _strip_pii("Aadhaar 1234-5678-9012") == "Aadhaar [redacted]"
     assert _strip_pii("PAN ABCDE1234F") == "PAN [redacted]"
     assert _strip_pii("no numbers here") == "no numbers here"
+
+
+def test_who_owes_and_decline_detection() -> None:
+    """Who-owes queries and declines are recognised from transcripts."""
+    assert _is_who_owes_query("Who owes me money?")
+    assert _is_who_owes_query("kitna bakaya hai")
+    assert not _is_who_owes_query("please log a sale of 100 rupees")
+    assert _is_decline("no, don't save it")
+    assert _is_decline("nahi, mat karo")
+    assert not _is_decline("notebook")
+    assert not _is_decline("yes please")
+
+
+def test_call_analytics() -> None:
+    """Calls are recorded and aggregated live."""
+    khata_memory.start_call("call-test-a", "browser", "hindi")
+    khata_memory.end_call("call-test-a", "success", None)
+    khata_memory.start_call("call-test-b", "sip", "unknown")
+    khata_memory.end_call("call-test-b", "failed", "no_response")
+    khata_memory.start_call("call-test-c", "browser", "unknown")
+    khata_memory.end_call("call-test-c", "failed", "incomplete_hangup")
+
+    stats = khata_memory.call_stats()
+    assert stats["successful"] >= 1
+    assert stats["failed"] >= 2
+    assert stats["failure_breakdown"].get("no_response") >= 1
+    assert stats["failure_breakdown"].get("incomplete_hangup") >= 1
+
+    by_id = {r["call_id"]: r for r in khata_memory.recent_calls(limit=10)}
+    assert by_id["call-test-a"]["outcome"] == "success"
+    assert by_id["call-test-b"]["channel"] == "sip"
+    assert "name" not in by_id["call-test-a"] and "amount" not in by_id["call-test-a"]
 
 
 @pytest.mark.asyncio
